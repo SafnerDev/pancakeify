@@ -1,0 +1,33 @@
+# build outputs
+build/
+*.dex
+!patcher/templates/*.dex
+out/
+dist/
+*.keystore
+*.jks
+
+# tools (large binaries, fetched by scripts)
+tools/*.jar
+tools/*.so
+tools/apktool*
+tools/lsplant*
+
+# pulled originals / patched apks (never commit copyrighted binaries)
+*.apk
+*.apks
+*.xapk
+spotify-orig/
+work/
+
+# gradle / android
+.gradle/
+local.properties
+.idea/
+*.iml
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/

@@ -1,0 +1,6 @@
+/* Pancakeify default theme — proof-of-inject. Tints WebView surfaces pancake-gold. */
+:root {
+  --pancakeify-accent: #e8b04b;
+}
+::selection { background: var(--pancakeify-accent); }
+body { transition: background-color .3s ease; }
