@@ -31,3 +31,8 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Pine AAR + extracted contents (fetch via stable/build_stable.sh / tools/README)
+tools/pine/
+tools/pine-core.aar
+tools/*.dex
