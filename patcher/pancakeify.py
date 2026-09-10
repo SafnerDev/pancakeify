@@ -26,6 +26,9 @@ from __future__ import annotations
 import argparse, os, re, shutil, subprocess, sys, tempfile, zipfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import axml  # noqa: E402  (local AXML string-pool editor)
+
 ROOT = Path(__file__).resolve().parent.parent
 TOOLS = ROOT / "tools"
 TEMPLATES = Path(__file__).resolve().parent / "templates"
@@ -260,6 +263,8 @@ def main():
     ap.add_argument("--input", required=True)
     ap.add_argument("--mode", choices=["roundtrip", "inject"], default="inject")
     ap.add_argument("--app-class", default=None)
+    ap.add_argument("--label", default="Pancakeify",
+                    help="new app display name (renames the 'Spotify' label string); '' to skip")
     ap.add_argument("--out", default=str(ROOT / "dist" / "pancakeify-spotify.apk"))
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
@@ -293,6 +298,18 @@ def main():
                 additions.append((f"lib/arm64-v8a/{so.name}", so))
             if not sos:
                 log("WARN: no tools/lib*.so — hooking disabled")
+
+        if args.label:
+            # The app label is a resource reference, so rename the value in resources.arsc
+            # (the exact "Spotify" value entry), not the manifest string pool.
+            with zipfile.ZipFile(universal) as z:
+                arsc = z.read("resources.arsc")
+            renamed = axml.rename_arsc_value(arsc, {"Spotify": args.label})
+            if renamed != arsc:
+                replace["resources.arsc"] = renamed
+                log(f"renamed app label 'Spotify' -> '{args.label}' in resources.arsc")
+            else:
+                log("label 'Spotify' not found in resources.arsc; skipping rename")
 
         patched = work / "patched.apk"
         repack(universal, patched, replace, additions)
