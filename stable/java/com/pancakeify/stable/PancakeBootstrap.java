@@ -35,7 +35,7 @@ public final class PancakeBootstrap {
                 Log.e(TAG, "HookEngine not ready; skipping features");
                 return;
             }
-            SideDrawer.install();   // add "Pancakeify Preferences" row
+            SettingsMod.install();   // add "Pancakeify Preferences" at top of Settings
         } catch (Throwable t) {
             Log.e(TAG, "bootstrap error (host untouched)", t);
         }
