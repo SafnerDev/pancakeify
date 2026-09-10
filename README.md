@@ -63,11 +63,27 @@ Device validated against: Pixel 10 Pro, Android 17 (SDK 37).
 
 - [x] RE windukk stable layer (bootstrap + dex loader + hook init)
 - [x] Pull & analyze target Spotify APK, find injection point
-- [ ] **M1** patcher: merge splits + apktool round-trip + re-sign (no mod yet) → installs & runs
-- [ ] **M2** inject bootstrap call + stable dex that just logs "Pancakeify alive"
-- [ ] **M3** integrate LSPlant, hook a trivial method to prove hooking on Android 17
+- [x] **M1/M2** surgical patcher (merge splits + inject bootstrap + stable dex + re-sign);
+      verified on device — logs "🥞 Pancakeify alive" from inside Spotify's process
+- [x] **M3** ART hooking on Android 17 via **Pine** — `Activity.onResume` hook fires on
+      `com.spotify.music.SpotifyMainActivity` (the exact case that crashed old LSPatch)
 - [ ] **M4** dynamic dex load (`Main.start`) + WebView CSS/JS injection → first theme
 - [ ] **M5** plugin loader + theme format + sample "Pancake Lyrics" plugin
 - [ ] **M6** OTA update channel for the dynamic layer (signed, SHA-256 manifest)
+
+> Hook engine: we picked **Pine** over LSPlant for M3 — LSPlant needs a separate inline-hook
+> backend (Dobby) + XposedBridge-style glue, while Pine ships prebuilt `.so` + a simple API
+> and measures ART layout at runtime. `HookEngine` is an engine-agnostic façade, so swapping
+> in LSPlant later is a one-file change.
+
+## Building the stable dex
+
+```bash
+bash stable/build_stable.sh   # javac + d8, bundles Pine -> tools/pancake-stable.dex + libpine.so
+python patcher/pancakeify.py --input ../spotify-orig --mode inject \
+    --app-class com.spotify.music.SpotifyApplication
+```
+The buildable stable sources are Java under `stable/java/` (no Gradle needed yet). The Kotlin
+under `stable/src/main/` (DexLoader, Env) is design reference for the M4 Gradle build.
 
 See `docs/ARCHITECTURE.md` for detail.

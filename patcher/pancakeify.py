@@ -288,11 +288,11 @@ def main():
             css = ROOT / "mod" / "src" / "main" / "assets" / "themes" / "default.css"
             if css.exists():
                 additions.append(("assets/themes/default.css", css))
-            so = TOOLS / "liblsplant.so"
-            if so.exists():
-                additions.append(("lib/arm64-v8a/liblsplant.so", so))
-            else:
-                log("WARN: liblsplant.so absent — hooking disabled until M3")
+            sos = sorted(TOOLS.glob("lib*.so"))
+            for so in sos:
+                additions.append((f"lib/arm64-v8a/{so.name}", so))
+            if not sos:
+                log("WARN: no tools/lib*.so — hooking disabled")
 
         patched = work / "patched.apk"
         repack(universal, patched, replace, additions)
