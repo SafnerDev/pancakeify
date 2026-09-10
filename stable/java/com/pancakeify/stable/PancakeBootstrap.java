@@ -1,13 +1,8 @@
 package com.pancakeify.stable;
 
-import android.app.Activity;
 import android.app.Application;
 import android.content.Context;
 import android.util.Log;
-
-import java.lang.reflect.Method;
-
-import top.canyie.pine.Pine;
 
 /**
  * Pancakeify STABLE-layer entry. The patcher injects one call to
@@ -21,6 +16,8 @@ import top.canyie.pine.Pine;
 public final class PancakeBootstrap {
     public static final String TAG = "Pancakeify";
 
+    public static Context appContext;
+
     private static boolean started = false;
 
     private PancakeBootstrap() {}
@@ -28,30 +25,19 @@ public final class PancakeBootstrap {
     public static synchronized void start(Application app, Context baseContext) {
         if (started) return;
         started = true;
+        Context c = baseContext.getApplicationContext();
+        appContext = (c != null) ? c : baseContext;
         Log.i(TAG, "🥞 Pancakeify alive: bootstrap injected into host attachBaseContext");
 
         try {
             // Spotify release build is not debuggable.
             if (!HookEngine.init(/*targetDebuggable=*/false)) {
-                Log.e(TAG, "HookEngine not ready; skipping M3 demo hook");
+                Log.e(TAG, "HookEngine not ready; skipping features");
                 return;
             }
-            installDemoHook();
+            SideDrawer.install();   // add "Pancakeify Preferences" row
         } catch (Throwable t) {
-            Log.e(TAG, "M3 bootstrap error (host untouched)", t);
+            Log.e(TAG, "bootstrap error (host untouched)", t);
         }
-    }
-
-    /** Hooks Activity.onResume to prove hooking is live. */
-    private static void installDemoHook() throws NoSuchMethodException {
-        Method onResume = Activity.class.getDeclaredMethod("onResume");
-        HookEngine.hook(onResume, new HookEngine.Callback() {
-            @Override public void before(Pine.CallFrame frame) {
-                Object act = frame.thisObject;
-                Log.i(TAG, "🥞 HOOK FIRED: Activity.onResume on "
-                        + (act != null ? act.getClass().getName() : "null"));
-            }
-        });
-        Log.i(TAG, "M3 demo hook installed on Activity.onResume");
     }
 }
