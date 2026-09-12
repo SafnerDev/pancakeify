@@ -5,9 +5,10 @@ import android.util.Log;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.HashMap;
+import java.util.Map;
 
 import top.canyie.pine.Pine;
 
@@ -15,169 +16,195 @@ import top.canyie.pine.Pine;
  * Adds a "Pancakeify Preferences" row at the TOP of Spotify's Settings screen (above
  * "Account").
  *
- * The Settings screen is built as a page object (obf. `Lp/biy0;`) holding a `List` of row
- * objects (obf. `Lp/aky0;`), assembled by page factories (`Lp/op;` / `Lp/ka5;`, both
- * implementing `create()`). We hook `create()`, detect the MAIN page (the one whose row list
- * contains a row titled `R.string.settings_page_account_title` — resolved at runtime, so we
- * anchor on the stable resource name, not obfuscated class names), clone that row with our
- * title, and insert it at index 0.
+ * Render path (9.1.80.2221): p.xlt.create() appends each row via static
+ * p.ion.h(collector, gtl). Each row is a `p.gtl` whose FIRST String field is a stable id
+ * ("accountPage", "playbackPage", …) and whose title lives in a `p.ftl` (Integer titleResId +
+ * optional String). We hook ion.h; when the "accountPage" row is about to be added we build
+ * our own row (a gtl cloned from it, with a fresh ftl whose title resolves — via a getText
+ * sentinel — to our text) and add it first, so it lands immediately above Account.
  *
- * v1: the cloned row keeps the Account row's click action (placeholder → opens Account).
- * Opening our own screen is the next step.
+ * Anchors are the stable id string "accountPage" (not obfuscated class names). v1 click reuses
+ * the Account row's action (placeholder → opens Account).
  */
 public final class SettingsMod {
-    static final int TITLE_SENTINEL = 0x7effff02;
     static final String TITLE_TEXT = "Pancakeify Preferences";
+    static final int TITLE_SENTINEL = 0x7effff02;
+    static final String ACCOUNT_ID = "accountPage";
+    static final String OUR_ID = "pancakeifyPrefs";
 
-    // Version-specific page factories (9.1.80.2221). Anchor: they implement create():biy0.
-    private static final String[] FACTORY_CLASSES = {"p.op", "p.ka5"};
-
-    private static int accountResId = 0;
+    private static Method addMethod;          // p.ion.h(collector, gtl)
+    private static boolean reentrant = false;
 
     private SettingsMod() {}
 
     public static void install() {
         try {
-            accountResId = PancakeBootstrap.appContext.getResources().getIdentifier(
-                    "settings_page_account_title", "string", PancakeBootstrap.appContext.getPackageName());
-            Log.i(PancakeBootstrap.TAG, "settings_page_account_title resId=" + Integer.toHexString(accountResId));
-            if (accountResId == 0) { Log.w(PancakeBootstrap.TAG, "account resid not found; skip"); return; }
-            hookTitle();
-            for (String fqcn : FACTORY_CLASSES) hookFactory(fqcn);
+            Class<?> ion = Class.forName("p.ion", false, PancakeBootstrap.appContext.getClassLoader());
+            for (Method m : ion.getDeclaredMethods()) {
+                if (Modifier.isStatic(m.getModifiers()) && m.getName().equals("h")
+                        && m.getParameterTypes().length == 2) { addMethod = m; break; }
+            }
+            if (addMethod == null) { Log.w(PancakeBootstrap.TAG, "ion.h not found"); return; }
+            addMethod.setAccessible(true);
+            HookEngine.hook(addMethod, new HookEngine.Callback() {
+                @Override public void before(Pine.CallFrame frame) {
+                    try { maybeInsert(frame); } catch (Throwable t) {
+                        Log.e(PancakeBootstrap.TAG, "settings insert error", t);
+                    }
+                }
+            });
+            Log.i(PancakeBootstrap.TAG, "settings row-add hook installed (ion.h)");
         } catch (Throwable t) {
             Log.e(PancakeBootstrap.TAG, "SettingsMod install failed", t);
         }
     }
 
+    /** Our sentinel title id → our text (covers both getText and getString paths). */
     private static void hookTitle() throws Exception {
-        HookEngine.hook(Resources.class.getMethod("getText", int.class), new HookEngine.Callback() {
+        HookEngine.Callback cb = new HookEngine.Callback() {
             @Override public void before(Pine.CallFrame frame) {
-                if (frame.args.length == 1 && (Integer) frame.args[0] == TITLE_SENTINEL) {
+                if (frame.args.length >= 1 && frame.args[0] instanceof Integer
+                        && (Integer) frame.args[0] == TITLE_SENTINEL) {
                     frame.setResult(TITLE_TEXT);
                 }
             }
-        });
+        };
+        HookEngine.hook(Resources.class.getMethod("getText", int.class), cb);
+        HookEngine.hook(Resources.class.getMethod("getString", int.class), cb);
     }
 
-    private static void hookFactory(String fqcn) {
+    private static void maybeInsert(Pine.CallFrame frame) throws Exception {
+        if (reentrant) return;
+        Object collector = frame.args[0];
+        Object row = frame.args[1];
+        if (row == null || !ACCOUNT_ID.equals(firstString(row))) return;
+
+        dumpOnce(row);
+        reentrant = true;
         try {
-            Class<?> cls = Class.forName(fqcn, false, PancakeBootstrap.appContext.getClassLoader());
-            java.lang.reflect.Method create = cls.getDeclaredMethod("create");
-            create.setAccessible(true);
-            HookEngine.hook(create, new HookEngine.Callback() {
-                @Override public void after(Pine.CallFrame frame) {
-                    try { augment(frame); } catch (Throwable t) {
-                        Log.e(PancakeBootstrap.TAG, "settings augment error", t);
-                    }
+            Object our = buildOurRow(row);
+            addMethod.invoke(null, collector, our);      // added before Account → lands above it
+            Log.i(PancakeBootstrap.TAG, "🥞 inserted 'Pancakeify Preferences' above Account");
+        } finally {
+            reentrant = false;
+        }
+    }
+
+    /** Clone the Account gtl: new id, and a new ftl whose title is ours (title-only, no subtitle). */
+    private static Object buildOurRow(Object accountGtl) throws Exception {
+        Map<String, Object> gtlOverrides = new HashMap<>();
+        // gtl.b = row id (String), gtl.c = ftl (title holder) — stable names for 9.1.80.2221
+        gtlOverrides.put("b", OUR_ID);
+        Object ftlOrig = getField(accountGtl, "c");
+        if (ftlOrig != null) {
+            Map<String, Object> ftlOverrides = new HashMap<>();
+            // Mirror the original Account row exactly: title is the resolved String in ftl.b,
+            // with ftl.a (resId) null. Just swap the text; blank the subtitle.
+            ftlOverrides.put("a", null);            // titleResId → none
+            ftlOverrides.put("b", TITLE_TEXT);      // titleText (this is what renders)
+            ftlOverrides.put("c", null);            // subtitle resId → none
+            ftlOverrides.put("d", null);            // subtitle text → none
+            gtlOverrides.put("c", reconstruct(ftlOrig, ftlOverrides));
+        }
+        Object row = reconstruct(accountGtl, gtlOverrides);
+        Log.i(PancakeBootstrap.TAG, "built our row id=" + firstString(row)
+                + " ftl.title=" + describeTitle(getField(row, "c")));
+        return row;
+    }
+
+    private static boolean dumped = false;
+    private static void dumpOnce(Object gtl) throws Exception {
+        if (dumped) return; dumped = true;
+        Log.i(PancakeBootstrap.TAG, "DUMP gtl " + gtl.getClass().getName());
+        for (Field f : instanceFields(gtl)) {
+            Object v = f.get(gtl);
+            Log.i(PancakeBootstrap.TAG, "DUMP  gtl." + f.getName() + " (" + f.getType().getSimpleName()
+                    + ") = " + brief(v));
+            if (v != null && !(v instanceof String) && !(v instanceof Integer)) {
+                for (Field g : instanceFields(v)) {
+                    Log.i(PancakeBootstrap.TAG, "DUMP    " + f.getName() + "." + g.getName() + " ("
+                            + g.getType().getSimpleName() + ") = " + brief(g.get(v)));
                 }
-            });
-            Log.i(PancakeBootstrap.TAG, "settings factory hook installed on " + fqcn + ".create()");
-        } catch (Throwable t) {
-            Log.w(PancakeBootstrap.TAG, "no factory " + fqcn + ": " + t.getMessage());
-        }
-    }
-
-    private static void augment(Pine.CallFrame frame) throws Exception {
-        Object page = frame.getResult();
-        if (page == null) return;
-
-        // Find the List field holding the rows, and the Account row within it.
-        Field listField = null;
-        List<?> rows = null;
-        Object accountRow = null;
-        for (Field f : page.getClass().getDeclaredFields()) {
-            if (!List.class.isAssignableFrom(f.getType())) continue;
-            f.setAccessible(true);
-            Object v = f.get(page);
-            if (!(v instanceof List)) continue;
-            for (Object row : (List<?>) v) {
-                Integer title = firstMatchingInteger(row, accountResId);
-                if (title != null) { listField = f; rows = (List<?>) v; accountRow = row; break; }
-            }
-            if (rows != null) break;
-        }
-        if (rows == null) return;                  // not the main settings page
-
-        Object clone = cloneRow(accountRow, TITLE_SENTINEL);
-        List<Object> newRows = new ArrayList<>();
-        newRows.add(clone);                         // top, above Account
-        //noinspection unchecked
-        newRows.addAll((List<Object>) rows);
-
-        Object newPage = rebuildPage(page, listField, newRows);
-        frame.setResult(newPage);
-        Log.i(PancakeBootstrap.TAG, "🥞 added 'Pancakeify Preferences' at top of Settings (page had "
-                + rows.size() + " rows)");
-    }
-
-    /** Returns the value of the row's Integer field iff it equals wanted (the title). */
-    private static Integer firstMatchingInteger(Object row, int wanted) throws Exception {
-        if (row == null) return null;
-        for (Field f : row.getClass().getDeclaredFields()) {
-            if (f.getType() == Integer.class) {
-                f.setAccessible(true);
-                Object v = f.get(row);
-                if (v instanceof Integer && (Integer) v == wanted) return (Integer) v;
             }
         }
-        return null;
+    }
+    private static String brief(Object v) {
+        if (v == null) return "null";
+        String s = String.valueOf(v);
+        return v.getClass().getSimpleName() + ":" + (s.length() > 60 ? s.substring(0, 60) : s);
     }
 
-    /** Clone a row via its constructor, feeding fields back in declared order, title swapped. */
-    private static Object cloneRow(Object row, int titleId) throws Exception {
-        Class<?> rc = row.getClass();
-        List<Object> vals = new ArrayList<>();
-        List<Field> instFields = new ArrayList<>();
-        for (Field f : rc.getDeclaredFields()) {
-            if (Modifier.isStatic(f.getModifiers())) continue;
-            f.setAccessible(true);
-            instFields.add(f);
-            vals.add(f.get(row));
+    private static Object getField(Object o, String name) throws Exception {
+        Field f = o.getClass().getDeclaredField(name);
+        f.setAccessible(true);
+        return f.get(o);
+    }
+
+    private static String describeTitle(Object ftl) throws Exception {
+        if (ftl == null) return "null-ftl";
+        return "a=" + getField(ftl, "a") + " b=" + getField(ftl, "b");
+    }
+
+    /** Rebuild `orig` via a matching constructor, applying field-name overrides. */
+    private static Object reconstruct(Object orig, Map<String, Object> overrides) throws Exception {
+        Class<?> rc = orig.getClass();
+        Field[] fields = instanceFields(orig);
+        Object[] vals = new Object[fields.length];
+        for (int i = 0; i < fields.length; i++) {
+            vals[i] = overrides.containsKey(fields[i].getName()) ? overrides.get(fields[i].getName())
+                                                                 : fields[i].get(orig);
         }
-        // Pick the constructor whose leading params match the instance fields (+ trailing int mask).
-        Constructor<?> ctor = null;
+        // exact arity, params fit the actual values
         for (Constructor<?> c : rc.getDeclaredConstructors()) {
             Class<?>[] pts = c.getParameterTypes();
-            if (pts.length == instFields.size() + 1
-                    && pts[pts.length - 1] == int.class) { ctor = c; break; }
+            if (pts.length == fields.length && valuesFit(pts, vals, fields.length)) {
+                c.setAccessible(true); return c.newInstance(vals);
+            }
         }
-        if (ctor == null) throw new NoSuchMethodException("row ctor for " + rc.getName());
-        ctor.setAccessible(true);
-
-        Object[] args = new Object[instFields.size() + 1];
-        for (int i = 0; i < instFields.size(); i++) args[i] = vals.get(i);
-        // swap the title: the first Integer-typed field is the title (b).
-        for (int i = 0; i < instFields.size(); i++) {
-            if (instFields.get(i).getType() == Integer.class) { args[i] = titleId; break; }
+        // Kotlin defaults: fields + trailing int mask
+        for (Constructor<?> c : rc.getDeclaredConstructors()) {
+            Class<?>[] pts = c.getParameterTypes();
+            if (pts.length == fields.length + 1 && pts[pts.length - 1] == int.class
+                    && valuesFit(pts, vals, fields.length)) {
+                c.setAccessible(true);
+                Object[] args = new Object[pts.length];
+                System.arraycopy(vals, 0, args, 0, vals.length);
+                args[args.length - 1] = 0;
+                return c.newInstance(args);
+            }
         }
-        args[args.length - 1] = 0;                   // defaults mask: none, we supply all
-        return ctor.newInstance(args);
+        throw new NoSuchMethodException("no ctor for " + rc.getName());
     }
 
-    /** Rebuild the page via its (v8u, v9v0, erx, List, List) constructor with the new row list. */
-    private static Object rebuildPage(Object page, Field listField, List<Object> newRows) throws Exception {
-        Class<?> pc = page.getClass();
-        List<Field> instFields = new ArrayList<>();
-        for (Field f : pc.getDeclaredFields()) {
+    private static Field[] instanceFields(Object o) {
+        java.util.List<Field> out = new java.util.ArrayList<>();
+        for (Field f : o.getClass().getDeclaredFields()) {
             if (Modifier.isStatic(f.getModifiers())) continue;
             f.setAccessible(true);
-            instFields.add(f);
+            out.add(f);
         }
-        // The real 5-arg ctor: same arity as fields, no trailing int.
-        Constructor<?> ctor = null;
-        for (Constructor<?> c : pc.getDeclaredConstructors()) {
-            Class<?>[] pts = c.getParameterTypes();
-            if (pts.length == instFields.size()
-                    && pts[pts.length - 1] != int.class) { ctor = c; break; }
-        }
-        if (ctor == null) throw new NoSuchMethodException("page ctor for " + pc.getName());
-        ctor.setAccessible(true);
+        return out.toArray(new Field[0]);
+    }
 
-        Object[] args = new Object[instFields.size()];
-        for (int i = 0; i < instFields.size(); i++) {
-            Field f = instFields.get(i);
-            args[i] = f.equals(listField) ? newRows : f.get(page);
+    /** True if each non-null value is assignable to the corresponding constructor param. */
+    private static boolean valuesFit(Class<?>[] pts, Object[] vals, int n) {
+        for (int i = 0; i < n; i++) {
+            Class<?> p = pts[i];
+            Object v = vals[i];
+            if (v == null) { if (p.isPrimitive()) return false; continue; }
+            if (p.isPrimitive()) {
+                if (!((p == int.class && v instanceof Integer) || (p == boolean.class && v instanceof Boolean)
+                        || (p == long.class && v instanceof Long) || (p == float.class && v instanceof Float)
+                        || (p == double.class && v instanceof Double))) return false;
+            } else if (!p.isInstance(v)) return false;
         }
-        return ctor.newInstance(args);
+        return true;
+    }
+
+    private static String firstString(Object o) throws Exception {
+        for (Field f : instanceFields(o)) {
+            if (f.getType() == String.class) return (String) f.get(o);
+        }
+        return null;
     }
 }
