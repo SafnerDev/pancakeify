@@ -511,3 +511,33 @@ PLAYER v8 (2026-10-08, polish): Spotify icons, overlapping lines, performance
       - AuroraView renders at 1/3 size and is scaled up (blur sigma 36dp/3); one reusable sweep gradient per line
         (local matrix) instead of a new LinearGradient per word per frame; the time label updates once a second;
         the seek bar skips sub-pixel redraws; dead queue helpers removed from MediaBridge.
+
+UPDATING TO A NEW SPOTIFY VERSION (done 2026-10-09: 9.1.80.2221 -> 9.1.90.2270)
+-----------------------------------------------------------------------------
+  1. Get the files: uninstall the patched app, install Spotify from Play, then
+       for p in $(adb shell pm path com.spotify.music | sed 's/package://'); do adb pull $p ../spotify-orig/; done
+     (keep older sets as ../spotify-orig-<version>/). The old patched APK is kept as dist/pancakeify-spotify-<ver>.apk.
+  2. Patch (needs JAVA_HOME + ANDROID_HOME=/mnt/data/Android/sdk on this box):
+       python3 patcher/pancakeify.py --input ../spotify-orig --mode inject --app-class com.spotify.music.SpotifyApplication \
+         --label Pancakeify --out dist/pancakeify-spotify-<ver>.apk
+     The patcher now (a) injects into attachBaseContext if the Application declares it, else (b) into the CONSTRUCTOR
+     (PancakeBootstrap.early arms a Pine hook on ContextWrapper.attachBaseContext) - 9.1.90 needed (b): the method is
+     final in superclass p.ef71 whose dex is at the 65 536 method limit; (c) zipalign/apksigner work on Linux (python
+     zipalign fallback, apksigner.jar).
+  3. Obfuscated names live ONLY in stable/.../Anchors.java (one row per version). How the 9.1.90 row was found
+     (baksmali every classesN.dex of base.apk into one folder, then grep):
+       - settings row builder:  grep -rl 'const-string v.*, "accountPage"'  -> p.pcr; it calls  fcp.q(String,int,bno0)
+         (-> p.fcp; was ion.q).  Rows are put in an array  new-array [Lp/d931; ... p.ay5.m0([Object)List  (was ion.h
+         static add(list,row)); Anchors.addArray=true handles that: we rebuild the array with our row in front.
+       - row element model / link holder / link read: class built at the end of fcp.q (wxd0 = old osa0, field b = link
+         holder p.e4g1 (old hka1), e4g1.a = link String) - read by zxd0 / b540 and passed to  ejl0.a(String,l170,Bundle)
+         (old tyh0.b); implementors of ejl0: p.l671, p.xw40, p.mmk0.  The path row -> model is searched (BFS), not fixed.
+       - title resolver: static (title model, Context)->String  p.vgk1.n  (old e9e1.s).
+       - Compose Color(long): grep -rh -A3 'const-wide v.*0xff1ed760L' | grep invoke-static  -> p.k5k1.e(J)J (old iae1.g).
+       - NowPlayingActivity (com.spotify.nowplaying.musicinstallation) and encore_icon_* drawables were unchanged;
+         the tapNative fractions (menu / device / queue) were unchanged too.
+     Unknown version -> Anchors.forVersion returns null: no Settings row / Main Color, player still works.
+  4. Test order: logcat 'Pancakeify:*' (anchors loaded, SettingsMod installed, inserted ... above Account) -> Settings
+     row opens prefs -> enable SpicyLyrics -> open Now Playing -> menu / queue / devices taps -> Main Color red + reset.
+     ALL of this passed on 9.1.90.2270. Login must be redone after uninstalling (signature changes).
+  NOTE: installing our build over a Play install is impossible (different signature) -> uninstall first.

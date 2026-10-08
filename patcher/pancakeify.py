@@ -66,13 +66,26 @@ def build_tool(name: str) -> str:
     sdk = find_sdk()
     if sdk:
         for bt in sorted((sdk / "build-tools").glob("*"), reverse=True):
-            for cand in (bt / name, bt / f"{name}.exe", bt / f"{name}.bat"):
+            cands = (bt / name, bt / f"{name}.exe", bt / f"{name}.bat") if os.name == "nt" else (bt / name,)
+            for cand in cands:
                 if cand.exists():
                     return str(cand)
     found = shutil.which(name)
     if found:
         return found
     die(f"{name} not found (install Android SDK build-tools)")
+
+
+def apksigner_cmd() -> list:
+    """apksigner as a command list: the .jar through java everywhere (the SDK's launcher is a .bat on Windows
+    and a shell script elsewhere); falls back to whatever build_tool finds."""
+    sdk = find_sdk()
+    if sdk:
+        for bt in sorted((sdk / "build-tools").glob("*"), reverse=True):
+            j = bt / "lib" / "apksigner.jar"
+            if j.exists():
+                return ["java", "-jar", str(j)]
+    return [build_tool("apksigner")]
 
 
 def keytool() -> str:
@@ -191,6 +204,37 @@ def inject_call(smali: Path):
     log(f"injected bootstrap call before return-void @ line {ret}")
 
 
+def _has_method(smali: Path, sig: str) -> bool:
+    for l in smali.read_text(encoding="utf-8").splitlines():
+        if l.strip().startswith(".method") and sig in l:
+            return True
+    return False
+
+
+def inject_ctor_call(smali: Path):
+    """Fallback for hosts that only INHERIT attachBaseContext (Spotify 9.1.90: it is final in p.ef71, in a dex that
+    is already at the 65 536 method-id limit, so nothing can be added there). We hook from the Application's own
+    constructor instead: PancakeBootstrap.early(app) arms a hook on ContextWrapper.attachBaseContext."""
+    lines = smali.read_text(encoding="utf-8").splitlines()
+    call = f"    invoke-static {{p0}}, L{BOOTSTRAP_CLASS};->early(Landroid/app/Application;)V"
+    start = None
+    for i, l in enumerate(lines):
+        if l.strip().startswith(".method") and "<init>()V" in l:
+            start = i
+            break
+    if start is None:
+        die("no no-arg constructor in the host Application class")
+    end = next((i for i in range(start, len(lines)) if lines[i].strip() == ".end method"), None)
+    if any(BOOTSTRAP_CLASS in l for l in lines[start:end]):
+        log("early call already present"); return
+    sup = next((i for i in range(start, end) if lines[i].strip().startswith("invoke-direct {p0}") and "-><init>()V" in lines[i]), None)
+    if sup is None:
+        die("super constructor call not found in the host Application constructor")
+    lines[sup + 1:sup + 1] = ["", call]
+    smali.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    log(f"injected early() call after the super constructor call @ line {sup}")
+
+
 def patch_dex(apk: Path, app_class: str, work: Path) -> tuple[str, Path]:
     dexname = dex_defining(apk, app_class, work) or die(f"no dex defines {app_class}")
     log(f"{app_class} defined in {dexname}")
@@ -201,7 +245,11 @@ def patch_dex(apk: Path, app_class: str, work: Path) -> tuple[str, Path]:
     smali = smali_dir / (app_class.replace(".", "/") + ".smali")
     if not smali.exists():
         die(f"{smali} missing after baksmali")
-    inject_call(smali)
+    if _has_method(smali, APP_METHOD):
+        inject_call(smali)
+    else:
+        log("host Application does not define attachBaseContext itself -> constructor injection")
+        inject_ctor_call(smali)
     out_dex = work / "patched_target.dex"
     run(["java", "-jar", jar("smali.jar"), "a", smali_dir, "-o", out_dex])
     return dexname, out_dex
@@ -247,11 +295,68 @@ def ensure_keystore(ks: Path):
          "-validity", "10000", "-dname", "CN=Pancakeify,O=Pancakeify,C=US"])
 
 
+# --- pure-python zipalign -p (the SDK on a Linux box may only ship zipalign.exe) ---
+def py_zipalign(src, dst, align_=4, so_align=4096):
+    """zipalign -p equivalent: STORED entries on 4-byte (.so on page) boundaries."""
+    with zipfile.ZipFile(src) as zin, open(dst, "wb") as out:
+        entries = []
+        for i in zin.infolist():
+            raw = zin.read(i.filename)
+            entries.append((i, raw))
+        cd = []
+        for i, raw in entries:
+            name = i.filename.encode()
+            stored = i.compress_type == zipfile.ZIP_STORED
+            if stored:
+                import zlib
+                data = raw
+                comp = data
+            else:
+                c = __import__("zlib").compressobj(6, 8, -15)
+                comp = c.compress(raw) + c.flush()
+            off = out.tell()
+            a = so_align if (stored and i.filename.endswith(".so")) else align_
+            extra = b""
+            if stored:
+                hdr = 30 + len(name)
+                pad = (-(off + hdr)) % a
+                extra = b"\0" * pad
+            crc = __import__("zlib").crc32(raw) & 0xffffffff
+            import struct
+            out.write(struct.pack("<IHHHHHIIIHH", 0x04034b50, 20, 0x0800, 0 if stored else 8,
+                                  0, 0x21, crc, len(comp), len(raw), len(name), len(extra)))
+            out.write(name); out.write(extra); out.write(comp)
+            cd.append((i, name, crc, len(comp), len(raw), off, 0 if stored else 8))
+        cd_off = out.tell()
+        for i, name, crc, cs, us, off, method in cd:
+            out.write(struct.pack("<IHHHHHHIIIHHHHHII", 0x02014b50, 20, 20, 0x0800, method, 0, 0x21,
+                                  crc, cs, us, len(name), 0, 0, 0, 0, i.external_attr, off))
+            out.write(name)
+        cd_size = out.tell() - cd_off
+        out.write(struct.pack("<IHHHHIIH", 0x06054b50, 0, 0, len(cd), len(cd), cd_size, cd_off, 0))
+
+
+def find_tool(name: str) -> str | None:
+    sdk = find_sdk()
+    if sdk:
+        for bt in sorted((sdk / "build-tools").glob("*"), reverse=True):
+            cands = (bt / name, bt / f"{name}.exe", bt / f"{name}.bat") if os.name == "nt" else (bt / name,)
+            for cand in cands:
+                if cand.exists():
+                    return str(cand)
+    return shutil.which(name)
+
+
 def align_and_sign(apk: Path, out: Path, ks: Path):
     aligned = apk.with_name("aligned.apk")
-    run([build_tool("zipalign"), "-p", "-f", "4", apk, aligned])
+    za = find_tool("zipalign")
+    if za:
+        run([za, "-p", "-f", "4", apk, aligned])
+    else:
+        log("zipalign not available here -> pure-python alignment")
+        py_zipalign(apk, aligned)
     ensure_keystore(ks)
-    run([build_tool("apksigner"), "sign", "--ks", ks, "--ks-pass", "pass:pancake",
+    run([*apksigner_cmd(), "sign", "--ks", ks, "--ks-pass", "pass:pancake",
          "--key-pass", "pass:pancake", str(aligned)])
     shutil.copy2(aligned, out)
 

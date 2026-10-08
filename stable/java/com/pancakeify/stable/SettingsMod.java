@@ -33,8 +33,9 @@ public final class SettingsMod {
     static final String OUR_ID = "pancakeifyPrefs";
     static final String ACCOUNT_ID = "accountPage";
 
-    private static Method qMethod;      // p.ion.q(String id,int,pwk0) -> gtl   (instance)
-    private static Method addMethod;    // p.ion.h(collector, gtl)              (static)
+    private static Anchors an;          // obfuscated names for this Spotify version
+    private static Method qMethod;      // builder: (String id, int, dest) -> row   (instance)
+    private static Method addMethod;    // how the row reaches the list (see Anchors.addArray)
     private static Object pendingRow;
     private static volatile boolean building = false, adding = false, overrideTitle = false;
 
@@ -45,26 +46,34 @@ public final class SettingsMod {
     public static void install() {
         try {
             trackActivity();
-            Class<?> ion = Class.forName("p.ion", false, PancakeBootstrap.appContext.getClassLoader());
-            for (Method m : ion.getDeclaredMethods()) {
+            an = Anchors.detect(PancakeBootstrap.appContext);
+            if (an == null) return;
+            ClassLoader cl = PancakeBootstrap.appContext.getClassLoader();
+            Class<?> builder = Class.forName(an.builderClass, false, cl);
+            for (Method m : builder.getDeclaredMethods()) {
                 Class<?>[] p = m.getParameterTypes();
-                if (m.getName().equals("q") && p.length == 3 && p[0] == String.class && p[1] == int.class) {
+                if (m.getName().equals(an.builderMethod) && p.length == 3 && p[0] == String.class && p[1] == int.class) {
                     qMethod = m;
-                } else if (Modifier.isStatic(m.getModifiers()) && m.getName().equals("h") && p.length == 2) {
-                    addMethod = m;
                 }
             }
+            Class<?> adder = Class.forName(an.addClass, false, cl);
+            for (Method m : adder.getDeclaredMethods()) {
+                if (!Modifier.isStatic(m.getModifiers()) || !m.getName().equals(an.addMethod)) continue;
+                Class<?>[] p = m.getParameterTypes();
+                if (an.addArray ? (p.length == 1 && p[0] == Object[].class) : p.length == 2) addMethod = m;
+            }
             if (qMethod == null || addMethod == null) {
-                Log.w(PancakeBootstrap.TAG, "ion.q/h not found (q=" + qMethod + " h=" + addMethod + ")"); return;
+                Log.w(PancakeBootstrap.TAG, "settings anchors not found (q=" + qMethod + " add=" + addMethod + ")"); return;
             }
             qMethod.setAccessible(true);
             addMethod.setAccessible(true);
 
-            hookNavigators(PancakeBootstrap.appContext.getClassLoader());   // early: also used for debug/NowPlaying
+            hookNavigators(cl);   // early: also used for debug/NowPlaying
             hookTitleResolver();
             hookBuilder();
             hookAdder();
-            Log.i(PancakeBootstrap.TAG, "SettingsMod installed (ion.q build + ion.h insert)");
+            Log.i(PancakeBootstrap.TAG, "SettingsMod installed (" + an.builderClass + "." + an.builderMethod
+                    + " build + " + (an.addArray ? "array" : "list") + " insert)");
         } catch (Throwable t) {
             Log.e(PancakeBootstrap.TAG, "SettingsMod install failed", t);
         }
@@ -72,13 +81,13 @@ public final class SettingsMod {
 
     /** e9e1.s(a9e1, Context): while we rebuild OUR row, make every title resolve to our text. */
     private static void hookTitleResolver() throws Exception {
-        Class<?> e9e1 = Class.forName("p.e9e1", false, PancakeBootstrap.appContext.getClassLoader());
+        Class<?> resolver = Class.forName(an.resolverClass, false, PancakeBootstrap.appContext.getClassLoader());
         Method s = null;
-        for (Method m : e9e1.getDeclaredMethods()) {
-            if (m.getName().equals("s") && m.getParameterTypes().length == 2
+        for (Method m : resolver.getDeclaredMethods()) {
+            if (m.getName().equals(an.resolverMethod) && m.getParameterTypes().length == 2
                     && m.getReturnType() == String.class) { s = m; break; }
         }
-        if (s == null) { Log.w(PancakeBootstrap.TAG, "e9e1.s not found"); return; }
+        if (s == null) { Log.w(PancakeBootstrap.TAG, "title resolver not found"); return; }
         s.setAccessible(true);
         HookEngine.hook(s, new HookEngine.Callback() {
             @Override public void before(Pine.CallFrame frame) {
@@ -108,19 +117,42 @@ public final class SettingsMod {
         });
     }
 
-    /** Insert our stashed row right before the Account row is added. */
+    /** Insert our stashed row right before the Account row reaches the list. */
     private static void hookAdder() {
         HookEngine.hook(addMethod, new HookEngine.Callback() {
             @Override public void before(Pine.CallFrame frame) {
                 if (adding || pendingRow == null) return;
                 try {
-                    if (!ACCOUNT_ID.equals(firstString(frame.args[1]))) return;
-                    adding = true;
-                    Object our = pendingRow;
-                    addMethod.invoke(null, frame.args[0], our);   // ours first → above Account
-                    Log.i(PancakeBootstrap.TAG, "🥞 inserted 'Pancakeify Preferences' above Account");
-                    armClick(our);
-                    pendingRow = null;
+                    if (an.addArray) {
+                        // rows are gathered in an array handed to Arrays.asList-like m0(Object[]): rebuild the array
+                        // with our row in front of Account's
+                        if (!(frame.args[0] instanceof Object[])) return;
+                        Object[] arr = (Object[]) frame.args[0];
+                        int at = -1;
+                        for (int i = 0; i < arr.length; i++) {
+                            if (arr[i] != null && qMethod.getReturnType().isInstance(arr[i])
+                                    && ACCOUNT_ID.equals(firstString(arr[i]))) { at = i; break; }
+                        }
+                        if (at < 0) return;
+                        adding = true;
+                        Object our = pendingRow;
+                        Object[] out = (Object[]) java.lang.reflect.Array.newInstance(arr.getClass().getComponentType(), arr.length + 1);
+                        System.arraycopy(arr, 0, out, 0, at);
+                        out[at] = our;
+                        System.arraycopy(arr, at, out, at + 1, arr.length - at);
+                        frame.args[0] = out;
+                        Log.i(PancakeBootstrap.TAG, "🥞 inserted 'Pancakeify Preferences' above Account");
+                        armClick(our);
+                        pendingRow = null;
+                    } else {
+                        if (!ACCOUNT_ID.equals(firstString(frame.args[1]))) return;
+                        adding = true;
+                        Object our = pendingRow;
+                        addMethod.invoke(null, frame.args[0], our);   // ours first → above Account
+                        Log.i(PancakeBootstrap.TAG, "🥞 inserted 'Pancakeify Preferences' above Account");
+                        armClick(our);
+                        pendingRow = null;
+                    }
                 } catch (Throwable t) {
                     Log.e(PancakeBootstrap.TAG, "insert error", t);
                 } finally {
@@ -158,11 +190,11 @@ public final class SettingsMod {
     private static void armClick(Object row) {
         try {
             ClassLoader cl = PancakeBootstrap.appContext.getClassLoader();
-            Class<?> hka1 = Class.forName("p.hka1", false, cl);
-            Class<?> osa0 = Class.forName("p.osa0", false, cl);
+            Class<?> hka1 = Class.forName(an.linkClass, false, cl);
+            Class<?> osa0 = Class.forName(an.modelClass, false, cl);
             Object link = hka1.getConstructor(String.class).newInstance(OUR_LINK);
 
-            Object model = findModel(getField(row, "g"), osa0, 0);
+            Object model = findModel(row, osa0);
             if (model == null) { Log.w(PancakeBootstrap.TAG, "row model (osa0) not found"); return; }
             Field f = osa0.getDeclaredField("b");
             f.setAccessible(true);
@@ -176,17 +208,34 @@ public final class SettingsMod {
         } catch (Throwable t) { Log.e(PancakeBootstrap.TAG, "armClick failed", t); }
     }
 
-    /** Depth-limited walk over instance fields looking for an instance of {@code want}. */
-    private static Object findModel(Object o, Class<?> want, int depth) throws Exception {
-        if (o == null || depth > 3) return null;
-        if (want.isInstance(o)) return o;
-        for (Field f : o.getClass().getDeclaredFields()) {
-            if (Modifier.isStatic(f.getModifiers()) || f.getType().isPrimitive()) continue;
-            f.setAccessible(true);
-            Object v = f.get(o);
-            if (v == null || v instanceof String) continue;
-            Object r = findModel(v, want, depth + 1);
-            if (r != null) return r;
+    /**
+     * Breadth-first walk over instance fields (shortest path first, identity-visited, capped) looking for an
+     * instance of {@code want}. The path from the row to its element model differs between Spotify versions, so it
+     * is searched instead of hard-coded.
+     */
+    private static Object findModel(Object start, Class<?> want) throws Exception {
+        java.util.ArrayDeque<Object[]> q = new java.util.ArrayDeque<>();     // {object, depth}
+        java.util.IdentityHashMap<Object, Boolean> seen = new java.util.IdentityHashMap<>();
+        q.add(new Object[]{start, 0});
+        seen.put(start, Boolean.TRUE);
+        int nodes = 0;
+        while (!q.isEmpty() && nodes++ < 4000) {
+            Object[] e = q.poll();
+            Object o = e[0];
+            int depth = (Integer) e[1];
+            if (want.isInstance(o)) return o;
+            if (depth >= 5) continue;
+            for (Class<?> k = o.getClass(); k != null && k != Object.class; k = k.getSuperclass()) {
+                String kn = k.getName();
+                if (kn.startsWith("java.") || kn.startsWith("android.") || kn.startsWith("kotlin.")) break;
+                for (Field f : k.getDeclaredFields()) {
+                    if (Modifier.isStatic(f.getModifiers()) || f.getType().isPrimitive()) continue;
+                    f.setAccessible(true);
+                    Object v = f.get(o);
+                    if (v == null || v instanceof String || v instanceof Number || v instanceof Boolean) continue;
+                    if (seen.put(v, Boolean.TRUE) == null) q.add(new Object[]{v, depth + 1});
+                }
+            }
         }
         return null;
     }
@@ -195,12 +244,11 @@ public final class SettingsMod {
     private static synchronized void hookNavigators(ClassLoader cl) {
         if (navHooked) return;
         navHooked = true;
-        String[] impls = {"p.s4h0", "p.qa20", "p.w621"};   // tyh0 implementors (9.1.80.2221)
-        for (String name : impls) {
+        for (String name : an.navClasses) {
             try {
                 for (Method m : Class.forName(name, false, cl).getDeclaredMethods()) {
                     Class<?>[] p = m.getParameterTypes();
-                    if (!m.getName().equals("b") || p.length != 3 || p[0] != String.class) continue;
+                    if (!m.getName().equals(an.navMethod) || p.length != 3 || p[0] != String.class) continue;
                     m.setAccessible(true);
                     HookEngine.hook(m, new HookEngine.Callback() {
                         @Override public void before(Pine.CallFrame frame) {

@@ -113,10 +113,12 @@ public final class MainColorMod {
 
     /** Compose Color(long): the ARGB value lives in the low 32 bits of the argument. */
     private static void hookCompose(ClassLoader cl) throws Exception {
-        Class<?> colorKt = Class.forName("p.iae1", false, cl);
+        Anchors an = Anchors.detect(PancakeBootstrap.appContext);
+        if (an == null) { Log.w(PancakeBootstrap.TAG, "MainColor: no anchors for this Spotify version"); return; }
+        Class<?> colorKt = Class.forName(an.colorClass, false, cl);
         for (Method m : colorKt.getDeclaredMethods()) {
             Class<?>[] p = m.getParameterTypes();
-            if (m.getName().equals("g") && Modifier.isStatic(m.getModifiers())
+            if (m.getName().equals(an.colorMethod) && Modifier.isStatic(m.getModifiers())
                     && p.length == 1 && p[0] == long.class && m.getReturnType() == long.class) {
                 m.setAccessible(true);
                 HookEngine.hook(m, new HookEngine.Callback() {
