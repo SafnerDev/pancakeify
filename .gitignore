@@ -36,3 +36,6 @@ venv/
 tools/pine/
 tools/pine-core.aar
 tools/*.dex
+
+# API secrets
+spicy_lyrics_secret_key.txt

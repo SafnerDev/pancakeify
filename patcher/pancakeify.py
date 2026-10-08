@@ -290,6 +290,9 @@ def main():
             mod = ROOT / "mod" / "build" / "pancake.dex"
             if mod.exists():
                 additions.append(("assets/pancake/pancake.dex", mod))
+            font = ROOT / "stable" / "assets" / "Inter.ttf"
+            if font.exists():
+                additions.append(("assets/pancake/Inter.ttf", font))
             css = ROOT / "mod" / "src" / "main" / "assets" / "themes" / "default.css"
             if css.exists():
                 additions.append(("assets/themes/default.css", css))

@@ -36,6 +36,9 @@ public final class PancakeBootstrap {
                 return;
             }
             SettingsMod.install();   // add "Pancakeify Preferences" at top of Settings
+            MediaBridge.install();   // capture Spotify's MediaSession (now playing data + controls)
+            PancakePlayer.install();  // Spicy-Lyrics style Now Playing screen (when enabled)
+            MainColorMod.install();  // recolour Spotify's green to the user's Main Color
         } catch (Throwable t) {
             Log.e(TAG, "bootstrap error (host untouched)", t);
         }

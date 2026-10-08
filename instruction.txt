@@ -1,0 +1,462 @@
+==============================================================================
+ PANCAKEIFY — build/modding instructions & hand-off notes
+ (write-up so a fresh chat can continue without re-deriving everything)
+ Last updated: 2026-09-12
+==============================================================================
+
+WHAT THIS IS
+------------
+Pancakeify = a Spicetify-like mod for the ORIGINAL Spotify Android app. We patch
+the official APK (like TikTokYou/exteraGram), inject a tiny runtime, and use ART
+method hooking to change/extend the app at runtime.
+
+Reference we reverse-engineered: "TikTok You" by windukk ("Индюк"). It uses a
+two-layer design (stable in-APK bootstrap + a dynamic mod dex). We reproduced the
+idea on OPEN-SOURCE parts.
+
+Target device/app used during development:
+  - Pixel 10 Pro, Android 17 (SDK 37)
+  - Spotify com.spotify.music, versionName 9.1.80.2221 (pulled via adb)
+  - Host Application class: com.spotify.music.SpotifyApplication
+  - Launcher activity: com.spotify.music.SpotifyMainActivity
+
+
+REPO LAYOUT (D:/pancakeify/pancakeify)
+--------------------------------------
+  patcher/pancakeify.py   The patcher CLI (merge splits, inject, repack, sign).
+  patcher/axml.py         Binary AXML / resources.arsc string editor (app rename).
+  stable/java/            The STABLE layer (plain Java, no Gradle). Compiled to a
+                          dex and baked into the APK. Contains:
+                            PancakeBootstrap.java  entry, called from attachBaseContext
+                            HookEngine.java        Pine-backed hook facade
+                            SettingsMod.java       the "Pancakeify Preferences" feature
+                            PancakePrefsScreen.java our mod-settings screen (a Dialog)
+  stable/build_stable.sh  javac + d8 build for the stable dex (bundles Pine).
+  stable/src/main/…       Kotlin design refs (DexLoader/Env) for a future Gradle build.
+  mod/                    Kotlin design refs for the DYNAMIC layer (M4, not built yet).
+  tools/                  Fetched binaries (gitignored): apktool? no — we use:
+                            APKEditor.jar (merge splits), baksmali.jar, smali.jar,
+                            pine/ (Pine AAR extracted), pancake-stable.dex, libpine.so
+  dist/pancakeify-spotify.apk   Output.
+  spotify-orig/           The original pulled split APKs (gitignored).
+  docs/                   ARCHITECTURE.md + scouting notes.
+  ../spotify-orig relative to repo = D:/pancakeify/spotify-orig
+
+
+TOOLCHAIN (Windows; paths as used)
+----------------------------------
+  JDK 25:  "C:/Program Files/Java/jdk-25.0.4.1/bin"  (javac, jar, d8 via SDK, keytool)
+  Android SDK: D:/Android/sdk  (build-tools/36.0.0 -> zipalign, apksigner, aapt2, d8;
+               platform-tools -> adb; platforms/android-36/android.jar)
+  IMPORTANT: the Windows javac/d8 need WINDOWS-style paths (D:/...), NOT MSYS /d/...
+  Pine: top.canyie.pine:core:0.3.0 from Maven Central (works on SDK 37).
+  baksmali/smali 2.5.2 from bitbucket JesusFreke downloads.
+  APKEditor V1.4.3 from github REAndroid.
+
+Fetch Pine + build stable dex:
+  cd tools
+  curl -L -o pine-core.aar https://repo1.maven.org/maven2/top/canyie/pine/core/0.3.0/core-0.3.0.aar
+  mkdir -p pine && (cd pine && unzip -o ../pine-core.aar)
+  cd .. && JDK_BIN="C:/Program Files/Java/jdk-25.0.4.1/bin" bash stable/build_stable.sh
+
+
+BUILD / PATCH / INSTALL (one cycle ≈ 3-4 min)
+---------------------------------------------
+  1) Build stable dex:
+       JDK_BIN="C:/Program Files/Java/jdk-25.0.4.1/bin" bash stable/build_stable.sh
+  2) Patch Spotify:
+       JAVA_HOME="C:/Program Files/Java/jdk-25.0.4.1" \
+       python patcher/pancakeify.py --input ../spotify-orig --mode inject \
+         --app-class com.spotify.music.SpotifyApplication --label Pancakeify \
+         --out dist/pancakeify-spotify.apk
+     (patcher takes >2 min — it baksmali-probes big dexes; run it backgrounded.)
+  3) Install + test:
+       adb install -r dist/pancakeify-spotify.apk
+       adb shell am force-stop com.spotify.music
+       adb logcat -c
+       adb shell monkey -p com.spotify.music -c android.intent.category.LAUNCHER 1
+       # open Settings: tap profile avatar then "Settings and privacy"
+       adb shell input tap 72 162 ; sleep 2 ; adb shell input tap 350 1064
+       adb logcat -d -s Pancakeify:*    # our logs (tag "Pancakeify")
+
+
+HOW THE PATCHER WORKS (patcher/pancakeify.py)  — "surgical", NOT full apktool
+----------------------------------------------------------------------------
+  Spotify installs as split APKs. Steps:
+   1. APKEditor "m" merges base+splits into one universal APK (sanitizes manifest,
+      sets extractNativeLibs=false).
+   2. Find the dex that DEFINES the host Application (baksmali-probe each classesN.dex
+      for the class file). For Spotify it's classes2.dex / SpotifyApplication.
+   3. baksmali ONLY that dex, inject ONE smali line at the end of attachBaseContext,
+      just before its final return-void:
+         invoke-static {p0, p0}, Lcom/pancakeify/stable/PancakeBootstrap;->start(Landroid/app/Application;Landroid/content/Context;)V
+      (p0 = this = the Application, which is also a Context.) smali reassembles the dex.
+   4. Repack the zip: replace that dex, ADD the stable dex as the next classesN.dex,
+      ADD tools/lib*.so into lib/arm64-v8a/ (libpine.so), preserve per-entry
+      compression (STORED for .so). Everything else byte-identical (resources untouched).
+   5. App rename: edit resources.arsc — the app label is a RESOURCE ref, not a manifest
+      string. patcher/axml.py rename_arsc_value() swaps the single "Spotify" value entry
+      in the arsc global value pool (UTF-8) -> "Pancakeify", preserving style spans, and
+      fixes chunk sizes. (The manifest string pool also has a "Spotify" at idx 197 but
+      that is NOT the label — don't use it.)
+   6. zipalign -p 4, then apksigner sign with a self-signed key
+      (pancakeify-debug.keystore, storepass/keypass "pancake"). Re-signing does NOT
+      break Spotify login (tested; Premium logged in fine).
+
+
+THE STABLE RUNTIME
+------------------
+  PancakeBootstrap.start(app, ctx)  (called from attachBaseContext):
+    - stores appContext (public static)
+    - HookEngine.init(targetDebuggable=false)  // Spotify release is not debuggable
+    - SettingsMod.install()
+  HookEngine = facade over Pine (top.canyie.pine). PineConfig.debuggable=false,
+    disableHiddenApiPolicy=true. Pine 0.3.0's guard only rejects SDK<19 (no upper
+    bound) and does runtime ArtMethod layout detection -> WORKS on Android 17.
+    API: HookEngine.hook(Member, Callback{before(frame), after(frame)}).
+    Pine CallFrame: .thisObject, .args (mutable), getResult()/setResult() (setResult in
+    before SKIPS the original call).
+
+
+HOOK ENGINE CHOICE
+------------------
+  We use PINE (not LSPlant). LSPlant needs a separate inline-hook backend (Dobby) +
+  XposedBridge-style glue; Pine ships prebuilt .so + a simple API. HookEngine is a
+  facade so swapping engines later = one file.
+
+
+=============================================================================
+ CASE STUDY: adding "Pancakeify Preferences" to the Settings screen
+ (this was the hard part — read before touching any Compose UI)
+=============================================================================
+
+THE APP RENAME (easy) — done via resources.arsc as above (--label).
+
+THE SETTINGS ROW (hard). Key lessons:
+
+1. The Settings screen is JETPACK COMPOSE + heavy R8 obfuscation. Methods take a
+   Composer param (obf. class `p.ryz`). There is NO classic RecyclerView/TextView for
+   the rows (TextView.setText is NEVER called for titles; uiautomator dump is empty).
+
+2. A settings row is an obfuscated data object `p.gtl`:
+     gtl.b = String  row id ("accountPage","playbackPage","aboutPage", ...)  <- STABLE anchor
+     gtl.c = p.ftl   title holder
+     gtl.d = p.rry   row spec (from isVisible()); d.b is a Function1 (fires on interaction),
+                     d.c is a p.tpz (BiFunction)
+     gtl.e = p.brd, gtl.f = p.rfr0 (dynamic subtitle provider), gtl.g = p.etl
+   The page is `p.biy0` (fields: v8u, v9v0 title, erx, List, List).
+
+3. The TITLE is NOT a plain field you can edit. It is resolved at BUILD time from an
+   `a9e1` model via:
+       p.e9e1.s(a9e1 model, Context) : String
+   where a9e1 is `p.v9v0`(int resId) -> getString(resId), or `p.dp31`(String literal)
+   -> returns it directly. The resolved title is then captured into the row's Compose
+   lambdas. => Cloning a row and editing its "title field" does NOT change what renders
+   (you get a duplicate "Account"). A deep object walk finds NO title field to edit.
+
+4. WHAT WORKS (implemented in SettingsMod.java): build our row with Spotify's OWN
+   builder and override the title resolver only during our build:
+     - Rows are created by  p.ion.q(String id, int iconIndex, p.pwk0 dest) : p.gtl
+       and appended by static  p.ion.h(p.dm70 collector, p.gtl row).
+       (NOTE: ion.q arg1 is a small icon/index int, NOT the title resId. Match the
+        account row by arg0 == "accountPage".)
+     - Hook ion.q: when arg0 == "accountPage", set overrideTitle=true and RE-INVOKE
+       ion.q(thisObject, "pancakeifyPrefs", arg1, arg2). While overrideTitle is true,
+       our hooked p.e9e1.s returns "Pancakeify Preferences". The fresh row's own lambdas
+       thus capture OUR title. Stash it as pendingRow.
+     - Hook ion.h: when the account row (id "accountPage") is about to be added, first
+       add our pendingRow -> it lands immediately above Account.
+   Result: a real, correctly-titled "Pancakeify Preferences" row at the top. VERIFIED.
+
+5. CLICK (DONE, verified 2026-10-08): gtl.d (p.rry) is a Flow, NOT a click handler -- hooking
+   its lambdas fired on every recomposition (dialog opened on any tap). The real click path:
+   row element model = p.osa0 (reachable gtl.g -> dtl.b -> o7a0 -> osa0); on tap the app calls
+   p.tyh0.b(String link, mb40, Bundle) with link = osa0.b(p.hka1).a. Fix (SettingsMod.armClick):
+   set our row's osa0.b to new hka1("spotify:internal:pancakeify:preferences") via reflection
+   and hook tyh0.b in its implementors (p.s4h0, p.qa20, p.w621): when link == ours, skip the
+   original and show PancakePrefsScreen.
+
+6. SUBTITLE (todo): the "Username • Free Premium for friends" subtitle comes from the
+   dynamic provider gtl.f (rfr0), inherited because we rebuild from the account config.
+   Not yet blanked.
+
+OUR MOD SCREEN: PancakePrefsScreen.show(ctx) is now a FULL-SCREEN Spotify-styled page (Dialog,
+   top bar + back arrow, bold section headers, green pill toggles saved in SharedPreferences
+   "pancakeify"; slide-in animation; hardware Back closes). Older note: it used to be an AlertDialog built entirely in code
+   (no manifest <activity>, no layout XML — you can't easily add those to a patched
+   APK). We track the current Activity via an Activity.onResume hook and show the dialog
+   on it.
+
+
+HOW TO ADD ANOTHER MODIFICATION / BUTTON (recipe)
+-------------------------------------------------
+  A) Find a STABLE anchor (a resource NAME or an id string), not an obfuscated class.
+     - String resources: aapt2 dump resources dist-or-merged.apk | grep "Your Text"
+       -> gives the resource name (e.g. settings_page_account_title) and 0x7f id.
+     - Resolve at runtime with ctx.getResources().getIdentifier(name,"string",pkg).
+  B) Find the builder/handler by DECOMPILING with baksmali (jadx hangs on these dex —
+     use baksmali; it's instant). To locate the class that references a resid, search
+     the dex bytes for the little-endian int, then baksmali that dex and grep the smali.
+     To find the RENDER path, hook e9e1.s (or getText) and log a stack trace — the
+     stack shows the real builder (that's how we found p.xlt.create -> p.ion.q).
+  C) Hook with Pine via HookEngine.hook(Method, Callback). Prefer:
+       - matching by a STABLE string (id/resource text), and
+       - matching your own objects by identity (== yourInstance) to affect only your row.
+  D) Build your own UI as a Dialog (PancakePrefsScreen pattern) to avoid manifest edits.
+  E) Obfuscated class/field letters (p.gtl, p.ion, p.e9e1, gtl.d.b, ftl.b, pwk0.Mx …)
+     CHANGE EVERY Spotify version. Re-derive them per version using B). Keep anchors
+     (id strings, resource names) — those are stable.
+
+
+GOTCHAS / TIME-SAVERS (learned the hard way)
+--------------------------------------------
+  - Phone AUTO-LOCK blocks adb-driven taps (they hit the lockscreen; we can't pass a
+    secure keyguard). Ask the user to disable auto-lock (Display timeout=Never, or
+    Developer options "Stay awake") before UI tests.
+  - logcat rotates FAST (Spotify is very chatty). Read with `adb logcat -d -s Pancakeify:*`
+    IMMEDIATELY after the action. A `nohup adb logcat` background process does NOT
+    persist between tool calls in this harness — use the tool's run_in_background, or
+    just read -d right after.
+  - jadx hangs after "Resetting disk code cache" on these dex — use baksmali instead.
+  - Windows javac/d8/keytool need Windows paths (D:/...). keytool lives in the JDK bin,
+    not on PATH.
+  - Spotify runs multiple processes; attachBaseContext (and our bootstrap) runs in each.
+    The UI/settings work happens in the main process.
+  - Re-signing is fine for login, but the app won't get Play updates (it's a separate
+    self-signed package with the same package name).
+
+
+CURRENT STATUS (2026-09-12)
+---------------------------
+  DONE & verified on device:
+    - Patcher (merge/inject/rename/sign) on Spotify 9.1.80.2221
+    - App renamed Spotify -> Pancakeify (launcher label)
+    - Pine ART hooking on Android 17
+    - "Pancakeify Preferences" row renders at top of Settings (correct title)
+    - PancakePrefsScreen (mod-settings Dialog) written
+  IN PROGRESS:
+    - Row CLICK -> open PancakePrefsScreen (hooking our row's d.b instance; verifying)
+    - Blank the inherited subtitle
+    - Our own row icon
+  NEXT (M4+): dynamic layer (assets/pancake/pancake.dex) + ThemeEngine (WebView CSS/JS)
+    for Spicy-Lyrics-style features.
+
+  Git: commits are in the repo; feature branch of history documents each milestone.
+==============================================================================
+
+
+LINUX DEV CYCLE (added 2026-10-08) -- seconds instead of 3-4 min
+------------------------------------------------------------------
+  No system JDK needed beyond a plain JDK 21 on PATH (e.g. Temurin tarball).
+    bash stable/build_stable.sh          # works on Linux now (javac + SDK d8.jar)
+    python3 tools/dev_deploy.py          # swap stable dex into dist/pancakeify-spotify.apk,
+                                         # align (pure python), sign (apksigner.jar), adb install -r
+  The full patcher is only needed if the injected smali / patched Spotify dex changes.
+  Test taps (1080x2410): avatar 72,162 -> "Settings and privacy" 350,1064 -> our row 387,665.
+  NOTE: the shell is fish; quote logcat tags:  adb logcat -d -s 'Pancakeify:*'
+  TODO: our row still shows Account's icon + "Username • Free Premium" subtitle (gtl.f).
+
+PREFS SCREEN v2 (2026-10-08)
+----------------------------
+  PancakePrefsScreen: cross-fade Dialog (transparent window, root alpha 0->1 over Settings),
+  Spotify Mix font via res/font/spotify_mix_ui_{regular,bold} (getIdentifier + getFont),
+  toggle drawn per spotify-toggle-switch.jpg (on = Main Color fill + dark knob; off = grey
+  outline + small grey knob). Sections: Appearance (Main Color swatch -> bottom-sheet HSV
+  picker + 10 presets + Reset; Enable SpicyLyrics toggle), About (Version 1.0.0, Discord pill).
+  Prefs file "pancakeify": main_color (absent = default #1ED760), spicy_lyrics.
+  PancakePrefsScreen.mainColor(ctx) = value for the future theme engine. NOTE: Main Color
+  currently recolours only our own page; app-wide recolour is NOT implemented yet.
+  TESTING: Spotify restores its last screen after relaunch -> ALWAYS screenshot before blind
+  taps (blind taps once hit the real app: mini-player / "Save in" sheet).
+  dev_deploy.py needs `java` on PATH.
+
+MAIN COLOR = APP-WIDE RECOLOUR (2026-10-08)
+-------------------------------------------
+  stable/java/.../MainColorMod.java, installed from PancakeBootstrap.start().
+  Spotify's brand green reaches the screen through 4 channels; each is hooked:
+   1. Compose: every colour constant goes through Compose Color(long) = p.iae1.g(J)J
+      (const-wide 0xffRRGGBBL ; invoke-static iae1.g). ~1300 call sites, ~480 distinct colours.
+      Hook `before`: rewrite args[0] low 32 bits. (iae1 name changes per Spotify version; find it
+      with: grep -rn "const-wide v.*0xff1ed760L" -A2 smali | grep invoke-static)
+   2. Resources (Encore tokens like dark_base_essential_brightaccent):
+      Resources.getColor(int,Theme), getColorStateList(int,Theme), TypedArray.getColor(int,int),
+      TypedArray.getColorStateList(int)   [mapStateList rebuilds a new ColorStateList].
+   3. Lottie animations (download/heart/bell/play-indicator in res/raw/*.json) build colours
+      with android.graphics.Color.argb/rgb -> hooked. Color.parseColor hooked too.
+   4. NOT covered: hard-coded fills in 22 XML vector drawables (cal_play/pause, radio/checkbox,
+      badges, cursors, logos) -- TypedArray.getComplexColor doesn't exist on this Android.
+  Mapping: colours with hue 138-144deg, S>=0.3, V>=0.15 (Spotify green family) are moved to
+  the chosen hue; S and V are scaled by chosen/ref (ref = 141deg, 0.86, 0.84) so dark/light
+  shades stay consistent.
+  Design tokens are static -> colour is applied at PROCESS START only. Hooks are installed only
+  if pref main_color exists (default green = zero overhead). Changing colour => prompt
+  "Reopen to apply" -> "Close Spotify" (auto-relaunch is impossible: Android BAL_BLOCK even for a
+  PendingIntent from an alarm; verified in logcat).
+  Perf check: 1.5% janky frames, p50 6ms while scrolling Home with hooks active.
+  TESTED: red, blue, purple presets, Reset -> green (hooks off).
+
+SPICY-LYRICS NOW PLAYING (2026-10-08)
+-------------------------------------
+  Files: MediaBridge, LyricsRepo, LyricsView, IconView, PancakePlayer (stable/java/...).
+  * Spotify's Now Playing is its own Activity: com.spotify.nowplaying.musicinstallation.NowPlayingActivity
+    (opened by tapping the mini-player). With pref spicy_lyrics=true, PancakePlayer hooks
+    Activity.onPostCreate (+ onResume fallback), and adds our PlayerRoot to the DecorView on top of
+    Spotify's content (their UI keeps running underneath, hidden). Must be a DecorView child and
+    bringToFront() every frame: DecorView adds its own status-bar background View above others.
+  * Data/controls: MediaSession of Spotify (same process). MediaBridge hooks MediaSession.setMetadata/
+    setPlaybackState/setActive to capture the session, then uses session.getController() (no permission
+    needed for our own session). Metadata keys: ALBUM_ART bitmap, com.spotify.music.extra.ART_HTTPS_URI,
+    CONTEXT_TITLE ("Liked Songs"), EXTRACTED_COLOR_DARK_HIGH_CONTRAST_BACKGROUND_BASE (#RRGGBB), MEDIA_ID.
+    Custom actions carry STATE in their ids: TURN_SHUFFLE_OFF = shuffle currently ON, CHECK_FILL = liked,
+    TURN_REPEAT_ALL_ON = repeat currently OFF (REPEAT_ONE_ON = all, REPEAT_OFF = one).
+  * Lyrics: LRCLIB (https://lrclib.net/api/get|search), line-synced LRC, cached in cacheDir/pancakeify_lyrics.
+    Spicy Lyrics' own API (api.spicylyrics.org) was NOT used (private, versioned, rate-limited).
+    Per-character fill inside the active line is interpolated (LRCLIB has no word timings).
+  * UI: blurred-cover drifting background, cover, title+explicit+like, lyrics card (expand / collapse),
+    seek bar, shuffle/prev/play/next/repeat. Tap a lyric line = seek. Swipe down on cover/title = close.
+  * Settings row subtitle: osa0.f (static subtitle) set to "Main Color • Spicy Lyrics".
+  * Settings page: Discord (blurple 5865F2) + "Reset all Settings" (red) with confirm sheet.
+  ADB test coords (1080x2410): mini-player title (302,2126) opens Now Playing; play (541,2218);
+  expand (845,1335); collapse (962,1335).
+
+PLAYER v2 (2026-10-08): Spicy-Lyrics look (replaces the card layout above)
+--------------------------------------------------------------------------
+  Layout (PancakePlayer): chevron + "Playing from" | cover 124dp + title/artist/E + like |
+  big lyrics (anchor 14% of height, fading edge) | seek bar + times | shuffle prev PLAY next repeat |
+  4 glass round buttons (resync LRCLIB / focus mode / lyrics timing +-100ms / Pancakeify prefs) |
+  device name (green, from the media notification sub-text "Listening on X") + share + queue.
+  Queue sheet = MediaController.getQueue() + skipToQueueItem. Timing offset pref lyrics_offset_ms.
+  AuroraView.java: AGSL (RuntimeShader) port of Kawarp (github.com/better-lyrics/kawarp, MIT):
+    blurred cover -> 4-octave simplex warp (centre weighted) -> vignette -> saturation 1.7 -> dither,
+    cross-fade between covers 900ms. Shader source was read from @kawarp/core 1.3.1 dist/index.js.
+  LyricsView.java: NEW native implementation following Spicy Lyrics' LyricsAnimator constants
+    (github.com/Spikerko/spicy-lyrics, AGPL-3.0, author allows use with credit -> Credits row in
+    Pancakeify Preferences > About): per-word damped springs scale (0.88Hz, zeta .64), y-offset
+    (1.45Hz, .40), glow (1.18Hz, .56) on the same keyframes; sung fill gradient; blur by distance;
+    3-dot interludes. Word timing is estimated from LINE timing (LRCLIB has no word timing).
+    Spicy Lyrics' own TTML/word-level data would need its private API -> NOT used.
+  Known: AuroraView needs Android 13+ (RuntimeShader) - falls back to flat colour otherwise.
+
+
+SPICY LYRICS API LYRICS (2026-10-08, later)
+-------------------------------------------
+  * LyricsRepo now asks the Spicy Lyrics API first, LRCLIB only as fallback:
+      GET https://api.spicylyrics.org/v1/lyrics/<spotify track id>   Authorization: Bearer <secret>
+      200 -> Body{Type:"Syllable", Content:[{Type:"Vocal", OppositeAligned, Lead{Syllables[{Text,
+             IsPartOfWord,StartTime,EndTime}],StartTime,EndTime}, Background:[{Syllables,StartTime,EndTime}]}],
+             StartTime,EndTime,source,...}   (times in SECONDS; IsPartOfWord = joins to the NEXT syllable)
+      404 -> not in Spicy DB -> LRCLIB. 429/network -> LRCLIB for now, NOT cached (retried next time).
+      Rate limit: 60 req/min (ratelimit-* headers). Types "Line" and "Static" are parsed defensively but
+      were never seen in testing (all probed tracks were Syllable).
+  * Track id comes from MediaMetadata MEDIA_ID ("spotify:track:XXXX").
+  * Cache: cacheDir/pancakeify_lyrics, key sha1("v2|"+mediaId). Spicy entries store the raw JSON
+    ({"spicy": "<raw>"}) and never expire; LRCLIB/miss entries expire after 24h so tracks Spicy adds
+    later get picked up. The "resync" glass button bypasses the cache.
+  * KEY: stable/build_stable.sh reads spicy_lyrics_secret_key.txt (gitignored) and generates
+    stable/build/gen/.../SpicyKey.java. The key therefore lives INSIDE the built APK -- never share a
+    build made with a real key. Without the file the key is "" and only LRCLIB is used.
+  * LyricsView: Block per text run (lead + each background part at 0.62x size); every syllable is its own
+    animated unit (springs + fill gradient); OppositeAligned lines are right-aligned (ALIGN_OPPOSITE,
+    scale pivot at the right edge); instrumental breaks (>=3.5 s) between lines show the 3 dots.
+    Font 27sp, cover 138dp, aurora saturation 1.5 / brightness 0.8 to match player_example.jpg.
+  * Logcat: "lyrics for <id>: spicy_lyrics (syllable)" / "lrclib (line|plain)" / "none".
+  * NOT done: per-letter animation of long held syllables (Spicy does it), "Line"-type visual check,
+    Spicy's UploadAttribution credit in the UI, scale-in animation for background vocals.
+  * Dev tips: deep-link a track with  adb shell am start -a android.intent.action.VIEW -d spotify:track:<id>
+    com.spotify.music ; tap seek bar y=1751 (x from 63 to 1020) to jump. Our toggle must be ON
+    (Settings -> Pancakeify Preferences -> Enable SpicyLyrics; tumbler ~ (973,759)). Home avatar is at
+    (85,236) in the current layout, not (72,162).
+
+PLAYER v3 (2026-10-08, evening): lyrics.png / buttons.png / written_by.png
+-----------------------------------------------------------------------
+  * Lyrics are heavier: FILL_AND_STROKE with stroke = 0.028em on the Spotify Mix bold face (STROKE_EM).
+  * AuroraView.soften(): halve to ~10px, then doubling bilinear steps up to 192px (a single big upscale gave
+    visible banding rings); dither 0.03. Result = smooth giant blobs like lyrics.png.
+  * Free scroll: touching the lyrics sets userScrollUntil (+4 s); LyricsView.freeMode -> every line alpha .82
+    (active 1.0), scale 1, NO blur. Leaving free mode re-applies blur-by-distance and re-centres.
+  * Interlude dots: DotsView row is collapsed (height 0, alpha 0) until the break is active, opens/closes with
+    a height animation. Dots: r=10dp, translucent (alpha .23 -> .6), |sin| hop 11dp, staggered. scrollToActive()
+    is now a ValueAnimator that re-reads the target each frame (rows above change height while it runs).
+  * Controls like buttons.png: REWIND/FORWARD double-triangle icons (IconView types 20/21), bare PLAY/PAUSE
+    (no circle, glyph .6), small shuffle/repeat; seek bar = 8dp pill, translucent track + light outline, white
+    fill, thumb only while dragging, times on both sides of the bar (one row).
+  * Credits (LyricsView.buildCredits) after the last line when r.fromSpicy: "Written by: <SongWriters>",
+    "Provided by: <Spicy Lyrics | Apple Music | ...>", and if UploadAttribution has Uploader/Maker:
+    "These lyrics have been provided by our community" + "Made by @x" / "Uploaded by @y" (underlined, tap opens
+    the spicylyrics.org profile) with a round avatar (Discord CDN, .gif/.webp swapped to .png size=64).
+    The bottom spacer shrinks by the credits' height so the end of the list is not a huge empty page.
+    Assumption: every lyric that comes through the Spicy API gets the sheet (incl. source=apple_music).
+  * No lyrics (Result notFound / instrumental without text) -> PancakePlayer.setBigCover(true): huge cover
+    (full width, <= 44% of screen height) with title + like under it, lyrics + glass row hidden. Back to the
+    lyrics layout as soon as a track with lyrics arrives. Only decided when a lyrics RESULT arrives (no flicker
+    while loading). A transient network failure also lands here (nothing cached, next track retries).
+  * MediaBridge.deviceName(): sub-text without "on " is no longer shown (it was the album name when playing
+    on the phone itself).
+  * Testing a "no lyrics" track: temporarily force it in PancakePlayer's lyrics callback (remember to revert).
+
+PLAYER v4 (2026-10-08, night): menu / devices / like anim / background / Spicy fidelity
+---------------------------------------------------------------------------------------
+  * Spicy Lyrics source is cloned for reference (NOT in the repo): github.com/Spikerko/spicy-lyrics (AGPL).
+    It is a SPICETIFY extension (needs window.Spicetify.*), so it cannot just be dropped into a WebView.
+    Useful files: src/css/Lyrics/Mixed.css (opacities, gradient alphas, line-height 1.1818),
+    src/utils/Lyrics/Animator/Lyrics/LyricsAnimator.ts (springs, glow, blur = min(1.25*distance, 7px)),
+    src/components/DynamicBG/ (background).
+  * FONT: Spicy's "SpicyLyrics" font (fonts.spikerko.org/spicy-lyrics) is Apple's San Francisco -> proprietary,
+    NOT bundled/downloaded. We ship Inter (SIL OFL) as assets/pancake/Inter.ttf (stable/assets/Inter.ttf; added by
+    tools/dev_deploy.py and patcher/pancakeify.py), loaded by LyricsFont (variable font, wght 700 / bg 600, opsz 28).
+    Size 29dp (Spicy: clamp(1.85rem, 7cqw, 3.5rem)), line spacing x0.977 (=1.1818em for Inter), bg lines 0.75x.
+  * Opacity model (LyricsView constants): resting rows OP_NOTSUNG .60 / OP_SUNG .75 x text S_NOTSUNG .60 /
+    S_SUNG .70; active line unsung .55 / sung .95 (+glow: shadow radius 4+2*g dp, alpha .35*g).
+    Spicy's raw numbers (.51x.35, .497x.85) were too dim next to lyrics.png, so they were tuned by eye; the ORDER
+    is kept so a line only brightens on activation (earlier build dipped -> "invisible then flash").
+    Blur: same on both sides, sigma = min(1.25*d,7)*0.7 dp, animated 380 ms (Row.blurAnim).
+  * Free scroll: row alpha .95, text .85, no blur (LineView.setReadable).
+  * Top-right "⋮" and bottom-left devices icon do NOT reimplement Spotify: PancakePlayer.tapNative() dispatches a
+    DOWN/UP pair straight to android.R.id.content (Spotify's hidden Now Playing UI, under our overlay) at fixed
+    window fractions NATIVE_MORE_{X,Y} (0.921,0.105) and NATIVE_DEVICE_{X,Y} (0.076,0.8985), measured on the
+    Pixel 10 Pro. Spotify's sheets (track menu, Connect picker) are their own windows, so they appear OVER our
+    overlay. Re-measure those fractions if the device / Spotify version changes. Hardware Back from the sheet also
+    finishes the Now Playing activity (Back goes to the activity, not only the sheet).
+  * Like button: heavier (ring 7%, plus/check stroke >= .26/.30). Animation (PancakePlayer.setLike): liked = filled
+    circle grows from the centre while the ring fades, check mark is drawn (IconView.drawProgress), view bounces
+    (scale only; fill overshoot would be clipped by the view bounds); unliked = plus spins in (-90deg -> 0) with
+    overshoot. First state after opening is applied without animation (likeKnown).
+  * AuroraView: speed 1.1 (was 3.0), shader time only advances while playing (motion eases to 0 on pause and the
+    view stops invalidating -> also saves battery), source blurred down to 4px + doubling upscale, plus a 36dp
+    RenderEffect Gaussian on the whole view. Frames are bit-identical on pause (PSNR ~60 dB).
+  * Device label (bottom-left): the laptop icon is always shown; green + name only when playing on another device.
+  * Tools used for testing: `adb shell screenrecord --size 540x1204` + ffmpeg (fps=12, crop) to inspect animations.
+
+PLAYER v5 (2026-10-08, late): ghost first word, Spicy dots, re-sync, native queue
+-------------------------------------------------------------------------------
+  * BUG FIXED - "first word of a line is ghostly/blurry": in LineView.onDraw a LinearGradient shader's output is
+    multiplied by the Paint's own alpha, and the paint kept the colour of the last word drawn in the previous
+    frame (unsung .55). The first word of a line (the only one mid-sweep right at the start) inherited it.
+    Fix: wp.setColor(WHITE) before wp.setShader(gradient). Lesson: always reset the paint colour when using shaders.
+  * Instrumental dots now follow Spicy's DotAnimations (LyricsAnimator.ts / Mixed.css): threshold 3 s (also for the
+    intro), the three dots fill one after another (each a third of the break), per dot springs: scale .75->1.05->1
+    (0.7 Hz/.6), lift -0.12em at 90% (1.25 Hz/.4), glow (1 Hz/.5), opacity .35->1; the whole group pops in/out with
+    a 5 Hz / .7 spring (pops out 150 ms before the next line; the gap row ends 250 ms early, GAP_END_PAD_MS).
+    Row stays collapsed (height 0) until active, like Spicy's .musical-line.
+  * Re-sync: LyricsView.snap() = next position update lands without animations (all LineViews reset(), states
+    applied instantly, scroll jumps after layout). Triggered by: new lyrics (setLyrics), playback going
+    non-playing -> playing (PancakePlayer.onState), and any position jump (< -300 ms or > +1500 ms between frames:
+    seek, restart, stall).
+  * Queue: the custom sheet is gone; the queue button forwards a tap to Spotify's own queue icon
+    (NATIVE_QUEUE_X/Y = 0.920 / 0.8985) like the other native buttons. Spotify's queue sheet (Edit / Shuffle /
+    Repeat / Timer) opens over our overlay. MediaBridge.queue()/skipToQueueItem are now unused.
+  * Item still OPEN: "Cast to TV" layout (tv_cast.png: landscape, cover + seek + title on the left, big blurred lyrics
+    on the right). Needs a decision on HOW the TV is connected - see the chat; nothing implemented yet.
+
+PLAYER v6 (2026-10-08, final fixes): blurred dots, heart
+---------------------------------------------------------
+  * instrumental.png is the reference for the interlude dots: soft/blurred dots, first one big + bright with a halo.
+    DotsView uses BlurMaskFilter (cached per quarter-dp radius; supported on the hardware canvas): radius
+    1.4dp + 2.6dp * (1 - progress), so dots that are not sung yet are softest; the halo is ONE blurred circle
+    (two stacked circles gave visible hard rings).
+  * Like button = classic Spotify heart (IconView.HEART: outline, filled when liked; no ring any more).
+    Animation (PancakePlayer.setLike): liked = colour fills the heart (heartFill 0->1 in 40%) while it pops with
+    easeOutBack from 55%; unliked = colour drains, small bounce. accent colour = Main Color.
+  * tools: if a build fails, tools/dev_deploy.py would still install the OLD dex; the scratchpad deploy helper now
+    aborts on javac errors - do the same in your own loop (check the javac output before deploying).
+  * Git: the repo had no remote when these were committed (see chat). gh CLI is not installed.
