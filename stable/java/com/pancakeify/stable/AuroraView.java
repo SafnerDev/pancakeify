@@ -92,12 +92,24 @@ public final class AuroraView extends View {
     private float warpIntensity = 1f;
     private boolean failed;
 
+    /** The background is so soft that it is rendered at 1/3 size and scaled up: ~9x less GPU work, same look. */
+    private static final int DOWNSCALE = 3;
+
     public AuroraView(Context c) {
         super(c);
         setBackgroundColor(0xFF0A0A0A);
-        // one more soft Gaussian over the whole shader output: no hard edges left anywhere
-        float px = 36f * c.getResources().getDisplayMetrics().density;
+        setPivotX(0f);
+        setPivotY(0f);
+        setScaleX(DOWNSCALE);
+        setScaleY(DOWNSCALE);
+        // one more soft Gaussian over the whole shader output (36dp on screen = 12dp at this size)
+        float px = 36f / DOWNSCALE * c.getResources().getDisplayMetrics().density;
         setRenderEffect(android.graphics.RenderEffect.createBlurEffect(px, px, Shader.TileMode.CLAMP));
+    }
+
+    @Override protected void onMeasure(int ws, int hs) {
+        int w = MeasureSpec.getSize(ws), h = MeasureSpec.getSize(hs);
+        setMeasuredDimension(Math.max(1, (w + DOWNSCALE - 1) / DOWNSCALE), Math.max(1, (h + DOWNSCALE - 1) / DOWNSCALE));
     }
 
     /** Sets the cover to derive the background from (cross-fades from the previous one). */

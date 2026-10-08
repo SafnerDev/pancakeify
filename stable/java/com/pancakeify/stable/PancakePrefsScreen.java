@@ -137,6 +137,24 @@ public final class PancakePrefsScreen {
         list.setOrientation(LinearLayout.VERTICAL);
         list.setPadding(0, dp(act, 8), 0, dp(act, 32));
 
+        // --- hero: the Pancakeify logo
+        LinearLayout hero = new LinearLayout(act);
+        hero.setOrientation(LinearLayout.VERTICAL);
+        hero.setGravity(Gravity.CENTER_HORIZONTAL);
+        hero.setPadding(dp(act, 16), dp(act, 20), dp(act, 16), dp(act, 12));
+        IconView logo = new IconView(act, IconView.PANCAKE).glyph(0.92f);
+        logo.setClickable(false);
+        hero.addView(logo, new LinearLayout.LayoutParams(dp(act, 88), dp(act, 88)));
+        TextView heroName = text(act, "Pancakeify", 24, FG, true);
+        heroName.setPadding(0, dp(act, 8), 0, 0);
+        heroName.setGravity(Gravity.CENTER_HORIZONTAL);
+        hero.addView(heroName);
+        TextView heroSub = text(act, "Spicetify for Android Spotify", 14, SUB, false);
+        heroSub.setPadding(0, dp(act, 4), 0, 0);
+        heroSub.setGravity(Gravity.CENTER_HORIZONTAL);
+        hero.addView(heroSub);
+        list.addView(hero);
+
         list.addView(header(act, "Appearance"));
 
         final Swatch swatch = new Swatch(act);
@@ -151,7 +169,11 @@ public final class PancakePrefsScreen {
         list.addView(row(act, "Enable SpicyLyrics", null, lyrics, v -> lyrics.toggle()));
 
         list.addView(header(act, "About"));
-        list.addView(row(act, "Pancakeify", "Version " + VERSION, null, null));
+        IconView aboutLogo = new IconView(act, IconView.PANCAKE).glyph(0.9f);
+        aboutLogo.setClickable(false);
+        aboutLogo.setMinimumWidth(dp(act, 36));
+        aboutLogo.setMinimumHeight(dp(act, 36));
+        list.addView(row(act, "Pancakeify", "Version " + VERSION, aboutLogo, null));
         list.addView(row(act, "Credits", "Lyrics player and lyrics data from Spicy Lyrics by Spikerko \u00b7 background based on Kawarp (MIT)", null, null));
         list.addView(actionButtons(act, root, sp, () -> lyrics.setChecked(false)));
 

@@ -64,6 +64,7 @@ public final class LyricsView extends ScrollView {
     private static final float OP_NOTSUNG = 0.60f, OP_SUNG = 0.75f;
     private static final float READ_TEXT = 0.85f, READ_ROW = 0.95f;      // free scrolling: everything readable
     private static final float FONT_DP = 29f;      // Spicy: clamp(1.85rem, 7cqw, 3.5rem) at phone width
+    private static final long STUCK_MS = 10000;           // a line "live" this long is bad data: stop waiting for it
     private static final long GAP_MS = 3000;           // Spicy getLyricsBetweenShow(): interludes from 3 s
     private static final long GAP_END_PAD_MS = 250;    // dots finish a little before the next line starts
     private static final int DOTS_H = 76;               // dp, full height of an open interlude row
@@ -78,6 +79,7 @@ public final class LyricsView extends ScrollView {
     private long userScrollUntil;
     private long offsetMs = 0;
     private ValueAnimator scrollAnim;
+    private int liveMask;                    // rows after the focus that are being sung right now (bit k = focus + 1 + k)
     private boolean snapNext = true;         // the very first position after (re)loading lands without animation
     private long lastRawPos = -1;
     private boolean freeMode;                // user is scrolling: everything readable, nothing blurred
@@ -87,6 +89,8 @@ public final class LyricsView extends ScrollView {
 
     private static final class Row {
         long start, end;
+        long fend;                // when this line stops being the current one (lead vocal end)
+        boolean wasLive;
         boolean gap;
         View view;
         LineView line;       // null for gaps
@@ -239,6 +243,12 @@ public final class LyricsView extends ScrollView {
     private Row addRow(long start, long end, LyricsRepo.Line line, boolean gap) {
         final Row row = new Row();
         row.start = start; row.end = end; row.gap = gap;
+        if (line != null) {                                   // a duet partner starting early must not steal the focus
+            long le = line.leadEndMs > line.startMs ? line.leadEndMs : (line.endMs > line.startMs ? line.endMs : end);
+            row.fend = Math.max(le, start + 300);
+        } else {
+            row.fend = end;
+        }
         if (gap) {
             DotsView dv = new DotsView(getContext());
             row.view = dv;
@@ -273,44 +283,58 @@ public final class LyricsView extends ScrollView {
             applyStates(active, false);
             if (!free) scrollToActive();
         }
-        int idx = -1;
-        for (int i = 0; i < rows.size(); i++) {
-            if (rows.get(i).start <= posMs + 40) idx = i; else break;
+        // Focus = the earliest line that has started and not finished yet: when two lines are sung together the view
+        // waits for the first to end before moving on. Lines that overlap it are "live" too and animate/brighten.
+        final int n = rows.size();
+        int focus = -1, lastStarted = -1;
+        for (int i = 0; i < n; i++) {
+            Row r = rows.get(i);
+            if (r.start > posMs + 40) break;
+            lastStarted = i;
+            if (focus < 0 && posMs < r.fend && posMs - r.start < STUCK_MS) focus = i;
         }
-        if (idx != active) {
-            int prev = active;
-            active = idx;
+        if (focus < 0) focus = lastStarted;
+        int mask = 0;
+        if (focus >= 0) {
+            for (int k = 1; k <= 4 && focus + k < n; k++) {
+                Row r = rows.get(focus + k);
+                if (r.start <= posMs + 40 && posMs < r.fend) mask |= 1 << (k - 1);
+            }
+        }
+        if (focus != active || mask != liveMask) {
+            boolean focusChanged = focus != active;
+            active = focus;
+            liveMask = mask;
             if (snapNext) {                          // re-sync: no animations, everything lands where it belongs
                 snapNext = false;
-                for (Row r : rows) if (r.line != null) r.line.reset();
-                applyStates(idx, true);
+                for (Row r : rows) { r.wasLive = false; if (r.line != null) r.line.reset(); }
+                applyStates(focus, true);
                 post(this::scrollInstantToActive);   // after layout: collapsed interludes just changed height
             } else {
-                if (prev >= 0 && prev < rows.size()) deactivate(rows.get(prev));
-                applyStates(idx, false);
-                scrollToActive();
+                applyStates(focus, false);
+                if (focusChanged) scrollToActive();
             }
         }
-        // the active line plus the two before it: earlier lines may still be sung (duets, overlaps)
-        // or settling their springs
-        for (int k = Math.max(0, active - 2); k <= active && k >= 0; k++) {
+        // animate the lines around the focus: two before (still settling) and the live ones after it
+        if (active < 0) return;
+        for (int k = Math.max(0, active - 2); k <= Math.min(n - 1, active + 4); k++) {
             Row r = rows.get(k);
+            boolean live = k == active || (k > active && ((liveMask >> (k - active - 1)) & 1) != 0);
             if (r.gap) {
-                ((DotsView) r.view).update(r.start, r.end, posMs, k == active);
+                ((DotsView) r.view).update(r.start, r.end, posMs, live);
             } else {
-                r.line.update(posMs, k == active);
+                if (r.wasLive && !live) r.line.finish();         // stopped being sung: settle the springs
+                r.line.update(posMs, live);
             }
+            r.wasLive = live;
         }
-    }
-
-    private void deactivate(Row r) {
-        if (!r.gap) r.line.finish();
     }
 
     /** Forces the next position update to re-sync from scratch (new song, play after pause, seek). */
     public void snap() {
         snapNext = true;
         active = -2;
+        liveMask = -1;
     }
 
     private void scrollInstantToActive() {
@@ -334,16 +358,18 @@ public final class LyricsView extends ScrollView {
                 continue;
             }
             float alpha, scale, blurDp;
+            // overlapping lines (duets): rows after the focus that are being sung right now look like the active one
+            boolean liveRow = d == 0 || (d > 0 && d <= 4 && liveMask > 0 && ((liveMask >> (d - 1)) & 1) != 0);
             if (!synced) { alpha = 0.92f; scale = 1f; blurDp = 0f; }
             else if (freeMode) { alpha = READ_ROW; scale = 1f; blurDp = 0f; }
-            else if (d == 0) { alpha = 1f; scale = 1f; blurDp = 0f; }
+            else if (liveRow) { alpha = 1f; scale = 1f; blurDp = 0f; }
             else {
                 alpha = d > 0 ? OP_NOTSUNG : OP_SUNG;
                 scale = 0.96f;
                 blurDp = LyricsSettings.blur ? Math.min(1.25f * Math.abs(d), 7f) * 0.7f : 0f;   // CSS radius -> Gaussian sigma
             }
             if (r.line != null) {
-                r.line.setSungState(!synced ? 1 : d == 0 ? 1 : d > 0 ? 0 : 2);
+                r.line.setSungState(!synced ? 1 : liveRow ? 1 : d > 0 ? 0 : 2);
                 r.line.setReadable(freeMode && synced);
             }
             if (r.lastAlpha != alpha || r.lastScale != scale) {
@@ -826,8 +852,7 @@ public final class LyricsView extends ScrollView {
                 else if (L.prog >= 1f) { wp.setShader(null); wp.setColor(cSung); }
                 else {
                     wp.setColor(WHITE);
-                    wp.setShader(new LinearGradient(0, 0, Math.max(1f, L.width), 0, new int[]{cSung, cSung, cUn, cUn},
-                            new float[]{0f, L.prog, Math.min(1f, L.prog + 0.2f), 1f}, Shader.TileMode.CLAMP));
+                    wp.setShader(sweep(cSung, cUn, Math.max(1f, L.width), L.prog));
                 }
                 float g = Math.max(0f, Math.min(1f, L.gl.x));
                 // Spicy: text-shadow 4 + 12g px at up to 185% opacity (we keep it a little softer)
@@ -838,6 +863,25 @@ public final class LyricsView extends ScrollView {
                 cv.restore();
             }
             wp.clearShadowLayer();
+        }
+
+        // One gradient (sung -> unsung over 1 px) reused for every word: the fill edge is placed with a local
+        // matrix (starts at p * width, 20% of the word wide, Spicy's soft edge) instead of building a new
+        // LinearGradient per word per frame.
+        private LinearGradient sweepShader;
+        private int sweepSung, sweepUn;
+        private final android.graphics.Matrix sweepM = new android.graphics.Matrix();
+
+        private Shader sweep(int cSung, int cUn, float width, float p) {
+            if (sweepShader == null || sweepSung != cSung || sweepUn != cUn) {
+                sweepShader = new LinearGradient(0f, 0f, 1f, 0f, cSung, cUn, Shader.TileMode.CLAMP);
+                sweepSung = cSung;
+                sweepUn = cUn;
+            }
+            sweepM.setScale(Math.max(1f, width * 0.2f), 1f);
+            sweepM.postTranslate(p * width, 0f);
+            sweepShader.setLocalMatrix(sweepM);
+            return sweepShader;
         }
 
         private int alpha(int argb, float f) {
@@ -887,13 +931,10 @@ public final class LyricsView extends ScrollView {
                         wp.setShader(null);
                         wp.setColor(cSung);
                     } else {
-                        float edge = Math.min(1f, p + 0.20f);          // Spicy: soft edge 20% of the word
                         // a shader's output is multiplied by the paint's own alpha: reset it, or the first word
                         // of a line inherits the previous word's (dim) colour and renders ghostly
                         wp.setColor(WHITE);
-                        wp.setShader(new LinearGradient(0, 0, w.width, 0,
-                                new int[]{cSung, cSung, cUn, cUn},
-                                new float[]{0f, p, edge, 1f}, Shader.TileMode.CLAMP));
+                        wp.setShader(sweep(cSung, cUn, w.width, p));
                     }
                     // Spicy: text-shadow blur 4 + 2*glow px, opacity min(glow * 35%, 100%)
                     float glow = Math.max(0f, Math.min(1f, w.gl.x)) * vis;

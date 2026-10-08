@@ -63,7 +63,8 @@ public final class LyricsRepo {
 
     public static final class Line {
         public final long startMs;
-        public long endMs;                  // end of the sung text (0 = unknown, LRC)
+        public long endMs;                  // end of the sung text incl. background vocals (0 = unknown, LRC)
+        public long leadEndMs;              // end of the lead vocal only: when the line stops being "the" current line
         public final String text;           // plain text of the lead vocal
         public List<Syl> syl;               // null for line-synced sources
         public boolean opposite;            // duet partner: right-aligned
@@ -288,6 +289,7 @@ public final class LyricsRepo {
                 if (syl.isEmpty()) continue;
                 l = new Line(ms(lead.optDouble("StartTime", syl.get(0).startMs / 1000.0)), joinSyllables(syl));
                 l.endMs = ms(lead.optDouble("EndTime", syl.get(syl.size() - 1).endMs / 1000.0));
+                l.leadEndMs = l.endMs;
                 l.syl = syl;
                 word = true;
             } else {                                   // "Line" sync: plain text + start/end
@@ -295,6 +297,7 @@ public final class LyricsRepo {
                 if (t.isEmpty()) continue;
                 l = new Line(ms(it.optDouble("StartTime", 0)), t);
                 l.endMs = ms(it.optDouble("EndTime", 0));
+                l.leadEndMs = l.endMs;
             }
             l.opposite = it.optBoolean("OppositeAligned", false);
             JSONArray bgs = it.optJSONArray("Background");

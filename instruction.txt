@@ -486,3 +486,28 @@ PLAYER v7 (2026-10-08, night): Spicy settings sheet, lyrics cache, letter animat
   * Git: remote origin = https://github.com/SafnerDev/pancakeify.git (HTTPS, no SSH key on this machine); the PAT is in
     ~/.git-credentials (mode 600) via `credential.helper store --file` set in the repo's local config. NEVER put it in
     the repo, the remote URL or notes.
+
+PLAYER v8 (2026-10-08, polish): Spotify icons, overlapping lines, performance
+-----------------------------------------------------------------------------
+  * Icons: share / queue / shuffle / repeat(+once) are Spotify's OWN vectors, loaded from the host app by name
+    (IconView.host("encore_icon_queue_24", fallbackType), tinted with the icon colour; falls back to the built-in
+    drawing if the resource is missing). Spotify's settings gear is Compose code with no resource, so IconView.GEAR
+    redraws it (outlined 8-tooth cog + inner ring). IconView.PANCAKE is the logo (own colours); it is shown on the
+    Pancakeify Preferences page (hero + About row). The "Pancakeify Preferences" ROW in Spotify's Settings still
+    shows Account's icon: ion.q's int is an analytics page index, the icon is a Compose object inside Spotify
+    (yv80.i / brd) - not changeable from here without deep, fragile hooks.
+  * IconView now measures itself with wrap_content (View's default grabs all the space offered).
+  * Overlapping lines (duets): focus (scroll anchor, blur distance) = the EARLIEST line that has started and not
+    finished (Row.fend = lead vocal end, Line.leadEndMs); a later line that starts early is "live" (bit in liveMask):
+    it animates and looks active but the view waits for the first line to end. Guard: a line live > 10 s
+    (STUCK_MS) is ignored as bad data. Verified on SICKO MODE at 96.5 s ("And they choking" / "Some-, some-").
+  * PERFORMANCE (measured with `dumpsys gfxinfo` A/B, same song/position, alternating installs - the phone's thermal
+    state makes absolute numbers drift, only compare alternating runs):
+      - MediaBridge.state()/metadata() returned controller.getXxx() = a BINDER CALL; positionMs() ran it every
+        frame (~0.3 ms). Now cached from the callback (doFrame 380 us -> 60 us).
+      - Spotify's own hidden Now Playing kept recomposing/drawing under the overlay: its content view is now
+        INVISIBLE (alpha 0 + invisible; tapNative() makes it VISIBLE for the touch and hides it again 400 ms later;
+        onDetached restores it). Janky frames 12-14% -> ~3.3%.
+      - AuroraView renders at 1/3 size and is scaled up (blur sigma 36dp/3); one reusable sweep gradient per line
+        (local matrix) instead of a new LinearGradient per word per frame; the time label updates once a second;
+        the seek bar skips sub-pixel redraws; dead queue helpers removed from MediaBridge.

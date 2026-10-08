@@ -3,6 +3,7 @@ package com.pancakeify.stable;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.drawable.Drawable;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.RectF;
@@ -13,7 +14,7 @@ public final class IconView extends View {
     public static final int CHEVRON_DOWN = 0, CHEVRON_UP = 1, PLAY = 2, PAUSE = 3, NEXT = 4, PREV = 5,
             SHUFFLE = 6, REPEAT = 7, REPEAT_ONE = 8, CHECK = 9, PLUS = 10, EXPAND = 11, COLLAPSE = 12,
             DEVICE = 13, SHARE = 14, QUEUE = 15, REFRESH = 16, TUNE = 17, GEAR = 18, MINUS = 19,
-            REWIND = 20, FORWARD = 21, MORE = 22, HEART = 23;
+            REWIND = 20, FORWARD = 21, MORE = 22, HEART = 23, PANCAKE = 24, HOST = 25;
 
     private int type;
     private int color = 0xFFFFFFFF;
@@ -24,6 +25,7 @@ public final class IconView extends View {
     private float ringWidth = 0.04f;    // ring stroke as a fraction of the view
     private float fillRadius = 1f;      // 0..1: the filled circle grows from the centre (like animation)
     private float drawProgress = 1f;    // 0..1: how much of the check mark is drawn
+    private Drawable host;             // Spotify's own vector (type HOST), tinted with {@link #color}
     private float heartFill = 0f;      // 0..1: how much of the heart is filled (like animation)
     private float strokeW = 0.16f;      // glyph stroke in glyph units (1 = half the glyph size)
     private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -48,6 +50,32 @@ public final class IconView extends View {
     public IconView strokeWidth(float w) { strokeW = w; invalidate(); return this; }
     public IconView heartFill(float f) { heartFill = f; invalidate(); return this; }
 
+    /**
+     * Uses one of Spotify's own icons (the host app's drawable, e.g. "encore_icon_queue_24") so the player
+     * shows exactly the default Spotify glyphs. Falls back to the built-in drawing if it is not found.
+     */
+    public IconView host(String drawableName, int fallbackType) {
+        Drawable d = null;
+        try {
+            int id = getResources().getIdentifier(drawableName, "drawable", getContext().getPackageName());
+            if (id != 0) {
+                Drawable raw = getContext().getDrawable(id);
+                if (raw != null) d = raw.mutate();
+            }
+        } catch (Throwable ignored) {}
+        host = d;
+        type = d != null ? HOST : fallbackType;
+        invalidate();
+        return this;
+    }
+
+    /** With wrap_content the view takes its minimum size (View's default would grab all the space offered). */
+    @Override protected void onMeasure(int ws, int hs) {
+        int w = MeasureSpec.getMode(ws) == MeasureSpec.EXACTLY ? MeasureSpec.getSize(ws) : getSuggestedMinimumWidth();
+        int h = MeasureSpec.getMode(hs) == MeasureSpec.EXACTLY ? MeasureSpec.getSize(hs) : getSuggestedMinimumHeight();
+        setMeasuredDimension(w, h);
+    }
+
     @Override protected void onDraw(Canvas cv) {
         float w = getWidth(), h = getHeight();
         float cx = w / 2f, cy = h / 2f, d = Math.min(w, h);
@@ -62,6 +90,18 @@ public final class IconView extends View {
             p.setStrokeWidth(Math.max(2f, s));
             p.setColor(ringColor);
             cv.drawCircle(cx, cy, d / 2f - p.getStrokeWidth() / 2f, p);
+        }
+        if (type == HOST && host != null) {
+            int sz = Math.round(d * glyph);
+            host.setBounds(Math.round(cx - sz / 2f), Math.round(cy - sz / 2f), Math.round(cx + sz / 2f), Math.round(cy + sz / 2f));
+            host.setTint(color);
+            host.draw(cv);
+            if (dot) {
+                p.setStyle(Paint.Style.FILL);
+                p.setColor(color);
+                cv.drawCircle(cx, cy + d * glyph / 2f + d * 0.08f, d * 0.035f, p);
+            }
+            return;
         }
         float u = d * glyph / 2f;               // unit = half glyph size
         cv.save();
@@ -197,17 +237,35 @@ public final class IconView extends View {
                 cv.drawCircle(-0.25f, -0.55f, 0.27f, p);
                 cv.drawCircle(0.35f, 0f, 0.27f, p);
                 cv.drawCircle(-0.05f, 0.55f, 0.27f, p); break;
-            case GEAR:
-                p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(0.3f);
-                cv.drawCircle(0f, 0f, 0.5f, p);
-                p.setStrokeWidth(0.32f);
+            case GEAR: {                        // outlined cog with 8 rounded teeth and an inner ring
+                Path cog = new Path();
+                final float rt = 0.93f, rr = 0.68f;             // tooth tip / root radius
+                final double tipHalf = Math.toRadians(10), baseHalf = Math.toRadians(14);
                 for (int i = 0; i < 8; i++) {
-                    double a = i * Math.PI / 4;
-                    cv.drawLine((float) Math.cos(a) * 0.62f, (float) Math.sin(a) * 0.62f,
-                            (float) Math.cos(a) * 0.9f, (float) Math.sin(a) * 0.9f, p);
+                    double c = Math.toRadians(i * 45.0 - 90.0);
+                    double[][] pts = {{c - baseHalf, rr}, {c - tipHalf, rt}, {c + tipHalf, rt}, {c + baseHalf, rr}};
+                    for (int k = 0; k < pts.length; k++) {
+                        float px = (float) (Math.cos(pts[k][0]) * pts[k][1]), py = (float) (Math.sin(pts[k][0]) * pts[k][1]);
+                        if (i == 0 && k == 0) cog.moveTo(px, py); else cog.lineTo(px, py);
+                    }
+                    // root between this tooth and the next: a few points along the root circle
+                    double from = c + baseHalf, to = Math.toRadians((i + 1) * 45.0 - 90.0) - baseHalf;
+                    for (int k = 1; k <= 3; k++) {
+                        double a2 = from + (to - from) * k / 4.0;
+                        cog.lineTo((float) (Math.cos(a2) * rr), (float) (Math.sin(a2) * rr));
+                    }
                 }
-                p.setStrokeWidth(0.16f);
-                cv.drawCircle(0f, 0f, 0.2f, p); break;
+                cog.close();
+                p.setStyle(Paint.Style.STROKE);
+                p.setStrokeWidth(0.17f);
+                p.setStrokeJoin(Paint.Join.ROUND);
+                cv.drawPath(cog, p);
+                cv.drawCircle(0f, 0f, 0.3f, p);
+                break;
+            }
+            case PANCAKE:
+                drawPancakes(cv);
+                break;
             case MINUS:
                 line(cv, 0.18f, -0.55f, 0f, 0.55f, 0f); break;
             default: break;
@@ -218,6 +276,49 @@ public final class IconView extends View {
             p.setColor(color);
             cv.drawCircle(cx, cy + d * glyph / 2f + d * 0.08f, d * 0.035f, p);
         }
+    }
+
+    /** The Pancakeify logo: three stacked pancakes with a butter pat and dripping syrup (own colours, not tinted). */
+    private void drawPancakes(Canvas cv) {
+        p.setStyle(Paint.Style.FILL);
+        final int edge = 0xFFC9792A, face = 0xFFEFB35E, hi = 0xFFF8D08A;
+        for (int i = 0; i < 3; i++) {                           // bottom to top
+            float y1 = 0.78f - i * 0.30f, y0 = y1 - 0.30f;
+            float inset = i == 2 ? 0f : (i == 1 ? 0.04f : 0.0f);
+            rect.set(-0.86f + inset, y0, 0.86f - inset, y1);
+            p.setColor(edge);
+            cv.drawRoundRect(rect, 0.15f, 0.15f, p);
+            rect.set(-0.80f + inset, y0 + 0.035f, 0.80f - inset, y1 - 0.07f);
+            p.setColor(face);
+            cv.drawRoundRect(rect, 0.12f, 0.12f, p);
+        }
+        // top face
+        rect.set(-0.84f, -0.50f, 0.84f, -0.06f);
+        p.setColor(hi);
+        cv.drawOval(rect, p);
+        // syrup: a pool on the top face with three drips over the edge
+        Path syrup = new Path();
+        syrup.moveTo(-0.62f, -0.30f);
+        syrup.cubicTo(-0.55f, -0.50f, 0.45f, -0.52f, 0.62f, -0.30f);
+        syrup.cubicTo(0.70f, -0.14f, 0.52f, -0.06f, 0.42f, -0.10f);
+        syrup.lineTo(0.42f, 0.16f);
+        syrup.cubicTo(0.42f, 0.28f, 0.26f, 0.28f, 0.26f, 0.16f);
+        syrup.lineTo(0.26f, -0.04f);
+        syrup.cubicTo(0.10f, 0.02f, -0.02f, 0.00f, -0.08f, -0.04f);
+        syrup.lineTo(-0.08f, 0.30f);
+        syrup.cubicTo(-0.08f, 0.44f, -0.26f, 0.44f, -0.26f, 0.30f);
+        syrup.lineTo(-0.26f, -0.04f);
+        syrup.cubicTo(-0.42f, -0.02f, -0.56f, -0.08f, -0.62f, -0.30f);
+        syrup.close();
+        p.setColor(0xFF8B4A1C);
+        cv.drawPath(syrup, p);
+        // butter pat
+        rect.set(-0.22f, -0.62f, 0.24f, -0.38f);
+        p.setColor(0xFFFFE08A);
+        cv.drawRoundRect(rect, 0.06f, 0.06f, p);
+        rect.set(-0.22f, -0.62f, 0.24f, -0.54f);
+        p.setColor(0xFFFFF1B8);
+        cv.drawRoundRect(rect, 0.06f, 0.06f, p);
     }
 
     /** Circular arc (start angle / sweep in degrees on a 0.65-radius circle) with an arrow head at its end. */

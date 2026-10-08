@@ -115,6 +115,8 @@ public final class PancakePlayer {
         private final View spacerTop, spacerBottom;
         private boolean bigCover;
         private boolean likeKnown, lastLiked, lastPlaying;
+        private int repeatIcon;
+        private long shownSec = -1;
         private ValueAnimator likeAnim;
         private IconView more;
         private final CoverView cover;
@@ -264,7 +266,7 @@ public final class PancakePlayer {
             // --- controls: shuffle | previous | play | next | repeat
             LinearLayout controls = new LinearLayout(a);
             controls.setGravity(Gravity.CENTER);
-            shuffle = new IconView(a, IconView.SHUFFLE).glyph(0.42f);
+            shuffle = new IconView(a, IconView.SHUFFLE).host("encore_icon_shuffle_24", IconView.SHUFFLE).glyph(0.5f);
             shuffle.setOnClickListener(v -> MediaBridge.sendAction(MediaBridge.findActionById("SHUFFLE")));
             prev = new IconView(a, IconView.REWIND).glyph(0.5f);
             prev.setOnClickListener(v -> MediaBridge.previous());
@@ -272,7 +274,7 @@ public final class PancakePlayer {
             play.setOnClickListener(v -> MediaBridge.togglePlay());
             next = new IconView(a, IconView.FORWARD).glyph(0.5f);
             next.setOnClickListener(v -> MediaBridge.next());
-            repeat = new IconView(a, IconView.REPEAT).glyph(0.42f);
+            repeat = new IconView(a, IconView.REPEAT).host("encore_icon_repeat_24", IconView.REPEAT).glyph(0.5f);
             repeat.setOnClickListener(v -> MediaBridge.sendAction(MediaBridge.findActionById("REPEAT")));
             controls.addView(shuffle, new LinearLayout.LayoutParams(0, dp(56), 1f));
             controls.addView(prev, new LinearLayout.LayoutParams(0, dp(56), 1f));
@@ -297,9 +299,9 @@ public final class PancakePlayer {
             LinearLayout.LayoutParams dl = new LinearLayout.LayoutParams(0, -2, 1f);
             dl.leftMargin = dp(10);
             bottomRow.addView(deviceText, dl);
-            share = new IconView(a, IconView.SHARE).glyph(0.62f);
+            share = new IconView(a, IconView.SHARE).host("encore_icon_share_android_24", IconView.SHARE).glyph(0.6f);
             share.setOnClickListener(v -> shareTrack());
-            queueBtn = new IconView(a, IconView.QUEUE).glyph(0.62f);
+            queueBtn = new IconView(a, IconView.QUEUE).host("encore_icon_queue_24", IconView.QUEUE).glyph(0.6f);
             queueBtn.setOnClickListener(v -> tapNative(NATIVE_QUEUE_X, NATIVE_QUEUE_Y));   // Spotify's own queue
             bottomRow.addView(share, new LinearLayout.LayoutParams(dp(44), dp(44)));
             LinearLayout.LayoutParams ql = new LinearLayout.LayoutParams(dp(44), dp(44));
@@ -340,6 +342,10 @@ public final class PancakePlayer {
 
         @Override protected void onAttachedToWindow() {
             super.onAttachedToWindow();
+            // Spotify's own Now Playing keeps drawing underneath: alpha 0 makes the GPU skip it entirely, while it
+            // still receives the touches we forward to it (tapNative); its sheets are separate windows.
+            View nativeUi = act.findViewById(android.R.id.content);
+            if (nativeUi != null) { nativeUi.setAlpha(0f); nativeUi.setVisibility(INVISIBLE); }
             applyInsets();
             MediaBridge.addListener(this);
             onMetadata(MediaBridge.metadata());
@@ -349,6 +355,8 @@ public final class PancakePlayer {
 
         @Override protected void onDetachedFromWindow() {
             super.onDetachedFromWindow();
+            View nativeUi = act.findViewById(android.R.id.content);          // give Spotify's own screen back
+            if (nativeUi != null) { nativeUi.setVisibility(VISIBLE); nativeUi.setAlpha(1f); }
             MediaBridge.removeListener(this);
             Choreographer.getInstance().removeFrameCallback(this);
         }
@@ -420,8 +428,11 @@ public final class PancakePlayer {
             PlaybackState.CustomAction rp = MediaBridge.findActionById("REPEAT");
             String rid = rp == null ? "" : String.valueOf(rp.getAction()).toUpperCase();
             boolean one = rid.contains("REPEAT_OFF"), all = rid.contains("REPEAT_ONE_ON");
-            repeat.type(one ? IconView.REPEAT_ONE : IconView.REPEAT)
-                  .color(one || all ? accent : Color.WHITE).dot(one || all).setAlpha(rp == null ? 0.4f : 1f);
+            if (repeatIcon != (one ? 2 : 1)) {                       // swap the glyph only when it really changes
+                repeatIcon = one ? 2 : 1;
+                repeat.host(one ? "encore_icon_repeat_once_24" : "encore_icon_repeat_24", one ? IconView.REPEAT_ONE : IconView.REPEAT);
+            }
+            repeat.color(one || all ? accent : Color.WHITE).dot(one || all).setAlpha(rp == null ? 0.4f : 1f);
         }
 
         @Override public void doFrame(long frameTimeNanos) {
@@ -435,7 +446,11 @@ public final class PancakePlayer {
             long pos = MediaBridge.positionMs();
             if (!seek.dragging) {
                 seek.setProgress(durationMs > 0 ? pos / (float) durationMs : 0f);
-                timeNow.setText(fmt(pos));
+                long sec = pos / 1000;
+                if (sec != shownSec) {                       // relayout the label once a second, not every frame
+                    shownSec = sec;
+                    timeNow.setText(fmt(pos));
+                }
             }
             lyrics.setPosition(pos);
             long now = System.currentTimeMillis();
@@ -520,6 +535,7 @@ public final class PancakePlayer {
                 final View content = act.findViewById(android.R.id.content);
                 View decor = act.getWindow().getDecorView();
                 if (content == null) return;
+                content.setVisibility(VISIBLE);            // hidden views get no touches: show (alpha is 0) for a moment
                 int[] loc = new int[2];
                 content.getLocationInWindow(loc);
                 final float x = fx * decor.getWidth() - loc[0], y = fy * decor.getHeight() - loc[1];
@@ -533,6 +549,7 @@ public final class PancakePlayer {
                     up.setSource(InputDevice.SOURCE_TOUCHSCREEN);
                     content.dispatchTouchEvent(up);
                     up.recycle();
+                    main.postDelayed(() -> { if (isAttachedToWindow()) content.setVisibility(INVISIBLE); }, 400);
                 }, 70);
             } catch (Throwable t) {
                 Log.w(PancakeBootstrap.TAG, "tapNative failed: " + t);
@@ -821,7 +838,8 @@ public final class PancakePlayer {
 
         private static String fmt(long ms) {
             long s = Math.max(0, ms) / 1000;
-            return (s / 60) + ":" + String.format("%02d", s % 60);
+            long sec = s % 60;
+            return (s / 60) + (sec < 10 ? ":0" : ":") + sec;
         }
 
         void previewTime(float f) { timeNow.setText(fmt((long) (f * durationMs))); }
@@ -848,7 +866,12 @@ public final class PancakePlayer {
 
         SeekBarView(Context c) { super(c); }
 
-        void setProgress(float f) { progress = Math.max(0f, Math.min(1f, f)); invalidate(); }
+        void setProgress(float f) {
+            f = Math.max(0f, Math.min(1f, f));
+            if (Math.abs(f - progress) < 0.0004f) return;          // sub-pixel change: nothing to redraw
+            progress = f;
+            invalidate();
+        }
 
         @Override protected void onDraw(Canvas cv) {
             float d = getResources().getDisplayMetrics().density;
