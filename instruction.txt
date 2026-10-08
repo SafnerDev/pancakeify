@@ -460,3 +460,29 @@ PLAYER v6 (2026-10-08, final fixes): blurred dots, heart
   * tools: if a build fails, tools/dev_deploy.py would still install the OLD dex; the scratchpad deploy helper now
     aborts on javac errors - do the same in your own loop (check the javac output before deploying).
   * Git: the repo had no remote when these were committed (see chat). gh CLI is not installed.
+
+PLAYER v7 (2026-10-08, night): Spicy settings sheet, lyrics cache, letter animation
+-----------------------------------------------------------------------------------
+  * The 4 glass buttons under the controls are gone. Top row = [chevron] Playing from [gear] [dots]. The gear opens
+    "Spicy Lyrics settings" (PancakePlayer.showSpicySettings): lyrics size (70-145%), font (Inter / Spotify Mix /
+    System / Serif), timing offset, blur inactive lines, letter-by-letter on long notes, focus mode, reload lyrics,
+    clear lyrics cache (+ entries/KB info), reset, and a link to the old Pancakeify preferences page.
+    Values live in LyricsSettings (prefs "pancakeify": lyrics_size / lyrics_font / lyrics_blur / lyrics_letters /
+    lyrics_focus; offset stays lyrics_offset_ms). Changing size / font / blur / letters calls LyricsView.restyle()
+    (rebuilds the rows from the last Result and re-syncs). LyricsFont is keyed by the font option.
+  * Lyrics cache now follows Spicy's LyricsStore (fetchLyrics.ts): CacheVersion 6, one JSON per track
+    {v, exp, spicy | lrc | none}, 3 days for Spicy data, 1 day for LRCLIB and for "no lyrics" (Spicy's NO_LYRICS),
+    in-memory LRU of 24 parsed Results (instant reopen), expired / old-version files purged once per process,
+    LyricsRepo.clearOne / clearAll / stats. "Reload lyrics" = clearOne + fetch.
+  * Letter-by-letter (Spicy's letterGroup): a syllable held >= 1000 ms (and > 1 char, not RTL) is split into letters,
+    equal time slices over [start, end - 250 ms]. Per letter: scale .95 -> 1.175 -> 1, lift (-1/56 em, drawn x2),
+    glow (4 + 12g px, up to 185% opacity, we use x0.75); the active letter's neighbours follow with falloff
+    1/(1+d^2.8) (scale, lift) and 1/(1+0.9d) (glow); sung letters keep an afterglow of .2. (LineView.updateLetters /
+    drawLetters.)
+  * The small gap in "blin|ded" is NOT a bug: the syllables are separate units and Spicy scales each one (0.95)
+    around its own centre too (the user pointed out the split is in the TTML itself).
+  * Dots: a dot that has been filled in is drawn sharp (blur radius 3.6dp * (1 - opacity progress), none below
+    0.25dp); not-yet-sung dots stay soft.
+  * Git: remote origin = https://github.com/SafnerDev/pancakeify.git (HTTPS, no SSH key on this machine); the PAT is in
+    ~/.git-credentials (mode 600) via `credential.helper store --file` set in the repo's local config. NEVER put it in
+    the repo, the remote URL or notes.

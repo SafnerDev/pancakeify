@@ -111,7 +111,7 @@ public final class PancakePlayer {
 
         private final AuroraView aurora;
         private final LinearLayout content;
-        private final LinearLayout topRow, headerRow, info, glassRow, bottomRow;
+        private final LinearLayout topRow, headerRow, info, bottomRow;
         private final View spacerTop, spacerBottom;
         private boolean bigCover;
         private boolean likeKnown, lastLiked, lastPlaying;
@@ -119,7 +119,7 @@ public final class PancakePlayer {
         private IconView more;
         private final CoverView cover;
         private final TextView context, title, artist, explicit, timeNow, timeTotal, deviceText;
-        private final IconView like, shuffle, prev, play, next, repeat, focus, resync, tune, gear, deviceIcon, share, queueBtn;
+        private final IconView like, shuffle, prev, play, next, repeat, gear, deviceIcon, share, queueBtn;
         private final SeekBarView seek;
         private final LyricsView lyrics;
 
@@ -156,6 +156,7 @@ public final class PancakePlayer {
             IconView down = new IconView(a, IconView.CHEVRON_DOWN).glyph(0.5f);
             down.setOnClickListener(v -> act.finish());
             topRow.addView(down, new LinearLayout.LayoutParams(dp(52), dp(52)));
+            topRow.addView(new View(a), new LinearLayout.LayoutParams(dp(44), 1));       // balances gear + dots on the right
             LinearLayout mid = new LinearLayout(a);
             mid.setOrientation(LinearLayout.VERTICAL);
             mid.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -168,6 +169,9 @@ public final class PancakePlayer {
             context.setEllipsize(android.text.TextUtils.TruncateAt.END);
             mid.addView(context);
             topRow.addView(mid, new LinearLayout.LayoutParams(0, -2, 1f));
+            gear = new IconView(a, IconView.GEAR).glyph(0.46f);
+            gear.setOnClickListener(v -> showSpicySettings());                           // Spicy Lyrics settings
+            topRow.addView(gear, new LinearLayout.LayoutParams(dp(44), dp(52)));
             more = new IconView(a, IconView.MORE).glyph(0.42f);
             more.setOnClickListener(v -> tapNative(NATIVE_MORE_X, NATIVE_MORE_Y));   // Spotify's own track menu
             topRow.addView(more, new LinearLayout.LayoutParams(dp(52), dp(52)));
@@ -280,26 +284,6 @@ public final class PancakePlayer {
             colp.topMargin = dp(4);
             content.addView(controls, colp);
 
-            // --- Spicy Lyrics' round glass buttons: resync | focus | timing | settings
-            glassRow = new LinearLayout(a);
-            glassRow.setGravity(Gravity.CENTER);
-            resync = glass(a, IconView.REFRESH);
-            resync.setOnClickListener(v -> reloadLyrics());
-            focus = glass(a, IconView.EXPAND);
-            focus.setOnClickListener(v -> setFocus(!focusMode));
-            tune = glass(a, IconView.TUNE);
-            tune.setOnClickListener(v -> showTimingSheet());
-            gear = glass(a, IconView.GEAR);
-            gear.setOnClickListener(v -> PancakePrefsScreen.show(act));
-            for (IconView g : new IconView[]{resync, focus, tune, gear}) {
-                LinearLayout.LayoutParams gp = new LinearLayout.LayoutParams(dp(52), dp(52));
-                gp.leftMargin = gp.rightMargin = dp(8);
-                glassRow.addView(g, gp);
-            }
-            LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(-1, -2);
-            glp.topMargin = dp(10);
-            content.addView(glassRow, glp);
-
             // --- bottom row (Spotify): device on the left, share + queue on the right
             bottomRow = new LinearLayout(a);
             bottomRow.setGravity(Gravity.CENTER_VERTICAL);
@@ -341,10 +325,7 @@ public final class PancakePlayer {
             topRow.setOnTouchListener(swipe);
 
             setOnApplyWindowInsetsListener((v, ins) -> { applyInsets(); return ins; });
-        }
-
-        private IconView glass(Context c, int type) {
-            return new IconView(c, type).glyph(0.42f).fill(0x2EFFFFFF).ring(0x59FFFFFF);
+            if (LyricsSettings.focus) post(() -> setFocus(true));
         }
 
         /** Raw window insets work even when a parent consumed the dispatched ones. */
@@ -585,7 +566,6 @@ public final class PancakePlayer {
             headerRow.setLayoutParams(hlp);
             int big = on ? VISIBLE : GONE;
             lyrics.setVisibility(on ? GONE : VISIBLE);
-            glassRow.setVisibility(big == VISIBLE ? GONE : VISIBLE);
             spacerTop.setVisibility(big);
             spacerBottom.setVisibility(big);
         }
@@ -597,7 +577,6 @@ public final class PancakePlayer {
             topRow.setVisibility(v);
             headerRow.setVisibility(v);
             bottomRow.setVisibility(v);
-            focus.type(on ? IconView.COLLAPSE : IconView.EXPAND);
         }
 
         private void shareTrack() {
@@ -612,26 +591,173 @@ public final class PancakePlayer {
             } catch (Throwable t) { Log.w(PancakeBootstrap.TAG, "share failed: " + t); }
         }
 
-        private void showTimingSheet() {
+        // ------------------------------------------------------------ Spicy Lyrics settings
+
+        /** Spicy Lyrics' own settings: size, font, timing, blur, letter animation, focus mode, cache. */
+        private void showSpicySettings() {
+            final Sheet sheet = new Sheet();
+            final LinearLayout list = new LinearLayout(act);
+            list.setOrientation(LinearLayout.VERTICAL);
+
+            // size
+            final TextView sizeVal = PancakePrefsScreen.text(act, sizeLabel(), 16, Color.WHITE, true);
+            list.addView(settingsRow("Lyrics size", stepper(sizeVal,
+                    () -> changeSize(-LyricsSettings.SIZE_STEP, sizeVal), () -> changeSize(LyricsSettings.SIZE_STEP, sizeVal))));
+            // font
+            final TextView[] chips = new TextView[LyricsSettings.FONT_NAMES.length];
+            LinearLayout fontRow = new LinearLayout(act);
+            for (int i = 0; i < chips.length; i++) {
+                final int idx = i;
+                chips[i] = chip(LyricsSettings.FONT_NAMES[i], i == LyricsSettings.font);
+                chips[i].setOnClickListener(v -> {
+                    LyricsSettings.font = idx;
+                    LyricsSettings.save(act);
+                    for (int k = 0; k < chips.length; k++) styleChip(chips[k], k == idx);
+                    lyrics.restyle();
+                });
+                LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(-2, dp(34));
+                cp.leftMargin = dp(6);
+                fontRow.addView(chips[i], cp);
+            }
+            list.addView(settingsRow("Font", fontRow));
+            // timing
+            final TextView offVal = PancakePrefsScreen.text(act, offsetLabel(), 16, Color.WHITE, true);
+            list.addView(settingsRow("Timing offset", stepper(offVal,
+                    () -> { changeOffset(-100); offVal.setText(offsetLabel()); },
+                    () -> { changeOffset(100); offVal.setText(offsetLabel()); })));
+            // switches
+            list.addView(settingsRow("Blur inactive lines", switchView(LyricsSettings.blur, on -> {
+                LyricsSettings.blur = on; LyricsSettings.save(act); lyrics.restyle(); })));
+            list.addView(settingsRow("Letter-by-letter on long notes", switchView(LyricsSettings.letters, on -> {
+                LyricsSettings.letters = on; LyricsSettings.save(act); lyrics.restyle(); })));
+            list.addView(settingsRow("Focus mode (lyrics only)", switchView(LyricsSettings.focus, on -> {
+                LyricsSettings.focus = on; LyricsSettings.save(act); setFocus(on); })));
+            // cache + actions
+            long[] st = LyricsRepo.stats(act);
+            final TextView cacheInfo = PancakePrefsScreen.text(act,
+                    st[0] + (st[0] == 1 ? " track" : " tracks") + " · " + (st[1] / 1024) + " KB cached (kept 3 days)", 13, 0x99FFFFFF, false);
+            cacheInfo.setPadding(0, dp(10), 0, dp(6));
+            list.addView(cacheInfo);
+            LinearLayout actions = new LinearLayout(act);
+            TextView reload = pill("Reload lyrics", false);
+            reload.setOnClickListener(v -> { sheet.close(); reloadLyrics(); });
+            final TextView clear = pill("Clear lyrics cache", false);
+            clear.setOnClickListener(v -> {
+                LyricsRepo.clearAll(act);
+                cacheInfo.setText("Cache cleared");
+                reloadLyrics();
+            });
+            LinearLayout.LayoutParams ap = new LinearLayout.LayoutParams(0, dp(44), 1f);
+            ap.rightMargin = dp(6);
+            actions.addView(reload, ap);
+            LinearLayout.LayoutParams ap2 = new LinearLayout.LayoutParams(0, dp(44), 1f);
+            ap2.leftMargin = dp(6);
+            actions.addView(clear, ap2);
+            list.addView(actions);
+            LinearLayout links = new LinearLayout(act);
+            links.setGravity(Gravity.CENTER_VERTICAL);
+            TextView reset = PancakePrefsScreen.text(act, "Reset these settings", 14, 0xCCFFFFFF, true);
+            reset.setPadding(0, dp(16), dp(20), dp(4));
+            reset.setOnClickListener(v -> {
+                LyricsSettings.reset(act);
+                lyrics.setOffsetMs(0);
+                prefs.edit().putLong(KEY_OFFSET, 0).apply();
+                setFocus(false);
+                sheet.close();
+                lyrics.restyle();
+            });
+            TextView prefsLink = PancakePrefsScreen.text(act, "Pancakeify preferences", 14, 0xCCFFFFFF, true);
+            prefsLink.setPadding(0, dp(16), 0, dp(4));
+            prefsLink.setOnClickListener(v -> { sheet.close(); PancakePrefsScreen.show(act); });
+            links.addView(reset);
+            links.addView(prefsLink);
+            list.addView(links);
+
             LinearLayout body = new LinearLayout(act);
             body.setOrientation(LinearLayout.VERTICAL);
-            body.addView(PancakePrefsScreen.text(act, "Lyrics timing", 20, Color.WHITE, true));
-            TextView hint = PancakePrefsScreen.text(act, "Positive values show the lyrics earlier.", 14, 0xB3FFFFFF, false);
-            hint.setPadding(0, dp(6), 0, dp(14));
-            body.addView(hint);
+            body.addView(PancakePrefsScreen.text(act, "Spicy Lyrics settings", 20, Color.WHITE, true));
+            MaxHeightScroll sv = new MaxHeightScroll(act, (int) (getHeight() * 0.74f));
+            sv.setOverScrollMode(OVER_SCROLL_NEVER);
+            sv.addView(list);
+            LinearLayout.LayoutParams svp = new LinearLayout.LayoutParams(-1, -2);
+            svp.topMargin = dp(8);
+            body.addView(sv, svp);
+            sheet.show(body);
+        }
+
+        private View settingsRow(String label, View trailing) {
             LinearLayout row = new LinearLayout(act);
-            row.setGravity(Gravity.CENTER);
-            final TextView val = PancakePrefsScreen.text(act, offsetLabel(), 22, Color.WHITE, true);
-            val.setGravity(Gravity.CENTER);
-            IconView minus = new IconView(act, IconView.MINUS).glyph(0.42f).fill(0x26FFFFFF).ring(0x59FFFFFF);
-            IconView plus = new IconView(act, IconView.PLUS).glyph(0.42f).fill(0x26FFFFFF).ring(0x59FFFFFF);
-            minus.setOnClickListener(v -> { changeOffset(-100); val.setText(offsetLabel()); });
-            plus.setOnClickListener(v -> { changeOffset(100); val.setText(offsetLabel()); });
-            row.addView(minus, new LinearLayout.LayoutParams(dp(52), dp(52)));
-            row.addView(val, new LinearLayout.LayoutParams(dp(140), -2));
-            row.addView(plus, new LinearLayout.LayoutParams(dp(52), dp(52)));
-            body.addView(row);
-            new Sheet().show(body);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setMinimumHeight(dp(54));
+            TextView t = PancakePrefsScreen.text(act, label, 16, Color.WHITE, false);
+            row.addView(t, new LinearLayout.LayoutParams(0, -2, 1f));
+            row.addView(trailing, new LinearLayout.LayoutParams(-2, -2));
+            return row;
+        }
+
+        private View stepper(TextView value, final Runnable minus, final Runnable plus) {
+            LinearLayout box = new LinearLayout(act);
+            box.setGravity(Gravity.CENTER_VERTICAL);
+            IconView m = new IconView(act, IconView.MINUS).glyph(0.42f).fill(0x26FFFFFF).ring(0x59FFFFFF);
+            IconView p = new IconView(act, IconView.PLUS).glyph(0.42f).fill(0x26FFFFFF).ring(0x59FFFFFF);
+            m.setOnClickListener(v -> minus.run());
+            p.setOnClickListener(v -> plus.run());
+            value.setGravity(Gravity.CENTER);
+            box.addView(m, new LinearLayout.LayoutParams(dp(38), dp(38)));
+            box.addView(value, new LinearLayout.LayoutParams(dp(68), -2));
+            box.addView(p, new LinearLayout.LayoutParams(dp(38), dp(38)));
+            return box;
+        }
+
+        private View switchView(boolean on, final PancakePrefsScreen.Toggle.Listener l) {
+            PancakePrefsScreen.Toggle t = new PancakePrefsScreen.Toggle(act, on);
+            t.onChange = l;
+            return t;
+        }
+
+        private TextView chip(String label, boolean selected) {
+            TextView c = PancakePrefsScreen.text(act, label, 13, Color.WHITE, true);
+            c.setGravity(Gravity.CENTER);
+            c.setPadding(dp(12), 0, dp(12), 0);
+            styleChip(c, selected);
+            return c;
+        }
+
+        private void styleChip(TextView c, boolean selected) {
+            GradientDrawable bg = new GradientDrawable();
+            bg.setCornerRadius(dp(17));
+            if (selected) bg.setColor(Color.WHITE); else { bg.setColor(0x1FFFFFFF); bg.setStroke(dp(1), 0x59FFFFFF); }
+            c.setBackground(bg);
+            c.setTextColor(selected ? 0xFF121212 : Color.WHITE);
+        }
+
+        private TextView pill(String label, boolean filled) {
+            TextView b = PancakePrefsScreen.text(act, label, 14, filled ? 0xFF121212 : Color.WHITE, true);
+            b.setGravity(Gravity.CENTER);
+            GradientDrawable bg = new GradientDrawable();
+            bg.setCornerRadius(dp(22));
+            if (filled) bg.setColor(Color.WHITE); else { bg.setColor(0x1FFFFFFF); bg.setStroke(dp(1), 0x59FFFFFF); }
+            b.setBackground(bg);
+            return b;
+        }
+
+        private String sizeLabel() { return Math.round(LyricsSettings.size * 100f) + "%"; }
+
+        private void changeSize(float delta, TextView label) {
+            float v = Math.round((LyricsSettings.size + delta) / LyricsSettings.SIZE_STEP) * LyricsSettings.SIZE_STEP;
+            LyricsSettings.size = Math.max(LyricsSettings.SIZE_MIN, Math.min(LyricsSettings.SIZE_MAX, v));
+            LyricsSettings.save(act);
+            label.setText(sizeLabel());
+            lyrics.restyle();
+        }
+
+        /** A ScrollView that never grows past {@code max} px. */
+        private final class MaxHeightScroll extends ScrollView {
+            private final int max;
+            MaxHeightScroll(Context c, int max) { super(c); this.max = max; }
+            @Override protected void onMeasure(int w, int h) {
+                super.onMeasure(w, MeasureSpec.makeMeasureSpec(max, MeasureSpec.AT_MOST));
+            }
         }
 
         private String offsetLabel() {

@@ -628,7 +628,7 @@ public final class PancakePrefsScreen {
      * Spotify's toggle: filled with the Main Color and a dark knob when on; dark fill, grey
      * outline and a small grey knob when off.
      */
-    private static final class Toggle extends View {
+    static final class Toggle extends View {
         interface Listener { void onChange(boolean on); }
         Listener onChange;
         private boolean on;

@@ -95,8 +95,11 @@ public final class LyricsView extends ScrollView {
         ValueAnimator blurAnim;
     }
 
+    private LyricsRepo.Result lastResult;
+
     public LyricsView(Context c) {
         super(c);
+        LyricsSettings.load(c);
         setVerticalScrollBarEnabled(false);
         setOverScrollMode(OVER_SCROLL_NEVER);
         setVerticalFadingEdgeEnabled(true);
@@ -139,7 +142,14 @@ public final class LyricsView extends ScrollView {
         column.addView(message, new LinearLayout.LayoutParams(-1, -2));
     }
 
+    /** Rebuilds the lines with the current settings (size / font / letter animation) and re-syncs. */
+    public void restyle() {
+        LyricsFont.reset();
+        if (lastResult != null) setLyrics(lastResult);
+    }
+
     public void setLyrics(LyricsRepo.Result r) {
+        lastResult = r;
         clearRows();
         if (r == null || r.notFound) { showMessage("No lyrics found for this track"); return; }
         if (r.instrumental && !r.synced() && r.plain == null) { showMessage("Instrumental"); return; }
@@ -330,7 +340,7 @@ public final class LyricsView extends ScrollView {
             else {
                 alpha = d > 0 ? OP_NOTSUNG : OP_SUNG;
                 scale = 0.96f;
-                blurDp = Math.min(1.25f * Math.abs(d), 7f) * 0.7f;       // CSS blur radius -> Gaussian sigma
+                blurDp = LyricsSettings.blur ? Math.min(1.25f * Math.abs(d), 7f) * 0.7f : 0f;   // CSS radius -> Gaussian sigma
             }
             if (r.line != null) {
                 r.line.setSungState(!synced ? 1 : d == 0 ? 1 : d > 0 ? 0 : 2);
@@ -499,12 +509,35 @@ public final class LyricsView extends ScrollView {
         boolean settled(float target) { return Math.abs(x - target) < 0.002f && Math.abs(v) < 0.01f; }
     }
 
-    private static final class Word {
-        int s, e;
+    /** One letter of a long held syllable (Spicy's letterGroup): its own springs, timed as an equal slice of the word. */
+    private static final class Letter {
         long t0, t1;
         float prog, width;
         final Spring sc = new Spring(), yo = new Spring(), gl = new Spring();
     }
+
+    private static final class Word {
+        int s, e;
+        long t0, t1;
+        float prog, width;
+        Letter[] letters;                       // non-null for syllables held >= 1 s
+        final Spring sc = new Spring(), yo = new Spring(), gl = new Spring();
+    }
+
+    // Spicy Lyrics LetterScaleRange / LetterYOffsetRange (y in em, drawn x2), glow as for words
+    private static final float[] LSC_T = {0f, 0.7f, 1f}, LSC_V = {0.95f, 1.175f, 1f};
+    private static final float[] LYO_T = {0f, 0.9f, 1f}, LYO_V = {1f / 100f, -1f / 56f, 0f};
+    private static final long LETTER_MIN_MS = 1000, LETTER_TAIL_MS = 250;
+
+    private static boolean isRtl(String t) {
+        for (int i = 0; i < t.length(); i++) {
+            byte d = Character.getDirectionality(t.charAt(i));
+            if (d == Character.DIRECTIONALITY_RIGHT_TO_LEFT || d == Character.DIRECTIONALITY_RIGHT_TO_LEFT_ARABIC) return true;
+        }
+        return false;
+    }
+
+    private static float easeSinOut(float t) { return (float) Math.sin(Math.max(0f, Math.min(1f, t)) * Math.PI / 2.0); }
 
     private static float keyframe(float[] t, float[] v, float p) {
         for (int i = 1; i < t.length; i++) {
@@ -535,8 +568,8 @@ public final class LyricsView extends ScrollView {
 
         Block(Context c, String text, boolean bg, List<LyricsRepo.Syl> syl, long start, long end) {
             this.text = text; this.bg = bg; this.start = start; this.end = end;
-            fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, bg ? FONT_DP * BG_SCALE : FONT_DP,
-                    c.getResources().getDisplayMetrics());
+            fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP,
+                    (bg ? FONT_DP * BG_SCALE : FONT_DP) * LyricsSettings.size, c.getResources().getDisplayMetrics());
             tp.setTextSize(fontPx);
             tp.setColor(WHITE);
             tp.setTypeface(LyricsFont.get(c, bg));
@@ -557,6 +590,21 @@ public final class LyricsView extends ScrollView {
                 w.e = pos + sy.text.length();
                 w.t0 = sy.startMs;
                 w.t1 = sy.endMs;
+                if (LyricsSettings.letters && sy.endMs - sy.startMs >= LETTER_MIN_MS && sy.text.length() > 1
+                        && !isRtl(sy.text)) {
+                    int n = sy.text.length();
+                    long end = Math.max(sy.startMs + 200, sy.endMs - LETTER_TAIL_MS);
+                    float ld = (end - sy.startMs) / (float) n;
+                    w.letters = new Letter[n];
+                    for (int k = 0; k < n; k++) {
+                        Letter L = new Letter();
+                        L.t0 = sy.startMs + Math.round(k * ld);
+                        L.t1 = sy.startMs + Math.round((k + 1) * ld);
+                        L.sc.x = LSC_V[0];
+                        L.yo.x = LYO_V[0];
+                        w.letters[k] = L;
+                    }
+                }
                 words.add(w);
                 pos = w.e + (i + 1 < syl.size() && !sy.partOfWord ? 1 : 0);
             }
@@ -612,7 +660,7 @@ public final class LyricsView extends ScrollView {
         LineView(Context c, LyricsRepo.Line line) {
             super(c);
             padH = dp(22);
-            padV = Math.round(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, FONT_DP * 0.17f,
+            padV = Math.round(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, FONT_DP * 0.17f * LyricsSettings.size,
                     c.getResources().getDisplayMetrics()));
             blockGap = dp(2);
             opposite = line.opposite;
@@ -643,7 +691,12 @@ public final class LyricsView extends ScrollView {
                         .setLineSpacing(0f, 0.977f)           // Inter is 1.21em tall; Spicy's line-height is 1.1818
                         .setIncludePad(false)
                         .build();
-                for (Word wd : b.words) wd.width = b.tp.measureText(b.text, wd.s, wd.e);
+                for (Word wd : b.words) {
+                    wd.width = b.tp.measureText(b.text, wd.s, wd.e);
+                    if (wd.letters != null)
+                        for (int k = 0; k < wd.letters.length; k++)
+                            wd.letters[k].width = b.tp.measureText(b.text, wd.s + k, wd.s + k + 1);
+                }
                 b.top = y;
                 y += b.layout.getHeight() + blockGap;
             }
@@ -659,6 +712,7 @@ public final class LyricsView extends ScrollView {
             lastNs = now;
             for (Block b : blocks) {
                 for (Word w : b.words) {
+                    if (w.letters != null) { updateLetters(w, b, posMs, dt); continue; }
                     w.prog = w.t1 > w.t0 ? Math.max(0f, Math.min(1f, (posMs - w.t0) / (float) (w.t1 - w.t0)))
                                          : (posMs >= w.t0 ? 1f : 0f);
                     w.sc.step(keyframe(SC_T, SC_V, w.prog), dt, 0.88f, 0.64f);
@@ -667,6 +721,39 @@ public final class LyricsView extends ScrollView {
                 }
             }
             invalidate();
+        }
+
+        /** Spicy's letter proximity animation: the active letter pops, its neighbours follow with a steep falloff. */
+        private void updateLetters(Word w, Block b, long posMs, float dt) {
+            int n = w.letters.length;
+            long start = w.t0, end = Math.max(start + 200, w.t1 - LETTER_TAIL_MS);
+            float ld = (end - start) / (float) n;
+            int act = -1;
+            float actPct = 0f;
+            if (posMs >= start && posMs < end) {
+                act = Math.min(n - 1, (int) ((posMs - start) / ld));
+                actPct = ((posMs - start) - act * ld) / ld;
+            }
+            for (int k = 0; k < n; k++) {
+                Letter L = w.letters[k];
+                int state = posMs < L.t0 ? 0 : (posMs >= L.t1 ? 2 : 1);
+                float tSc = LSC_V[0], tYo = LYO_V[0], tGl = 0f;
+                if (act >= 0) {
+                    float dist = Math.abs(k - act);
+                    float fall = (float) (1.0 / (1.0 + Math.pow(dist, 2.8)));
+                    float gfall = 1f / (1f + dist * 0.9f);
+                    tSc = LSC_V[0] + (keyframe(LSC_T, LSC_V, actPct) - LSC_V[0]) * fall;
+                    tYo = LYO_V[0] + (keyframe(LYO_T, LYO_V, actPct) - LYO_V[0]) * fall;
+                    tGl = keyframe(GL_T, GL_V, actPct) * gfall;
+                }
+                if (state == 0) { tSc = LSC_V[0]; tYo = LYO_V[0]; tGl = 0f; }      // not sung yet: resting
+                else if (state == 2 && act == -1) tGl = 0.2f;                       // sung: faint afterglow
+                L.prog = state == 0 ? 0f : state == 2 ? 1f : easeSinOut((posMs - L.t0) / (float) Math.max(1, L.t1 - L.t0));
+                L.sc.step(tSc, dt, 0.88f, 0.64f);
+                L.yo.step(tYo, dt, 1.45f, 0.40f);
+                L.gl.step(tGl, dt, 1.18f, 0.56f);
+            }
+            w.prog = posMs < start ? 0f : posMs >= end ? 1f : (posMs - start) / (float) Math.max(1, end - start);
         }
 
         /** Back to the resting look (after a seek or restart). */
@@ -678,6 +765,12 @@ public final class LyricsView extends ScrollView {
                     w.sc.x = SC_V[0]; w.sc.v = 0f;
                     w.yo.x = YO_V[0] * b.fontPx; w.yo.v = 0f;
                     w.gl.x = 0f; w.gl.v = 0f;
+                    if (w.letters != null) for (Letter L : w.letters) {
+                        L.prog = 0f;
+                        L.sc.x = LSC_V[0]; L.sc.v = 0f;
+                        L.yo.x = LYO_V[0]; L.yo.v = 0f;
+                        L.gl.x = 0f; L.gl.v = 0f;
+                    }
                 }
             }
             invalidate();
@@ -706,9 +799,45 @@ public final class LyricsView extends ScrollView {
         private boolean settled() {
             if (lastPos < lineEnd) return false;                     // still being sung (overlap / duet)
             for (Block b : blocks)
-                for (Word w : b.words)
+                for (Word w : b.words) {
+                    if (w.letters != null) {
+                        for (Letter L : w.letters)
+                            if (!L.sc.settled(1f) || !L.yo.settled(LYO_V[2]) || !L.gl.settled(0.2f)) return false;
+                        continue;
+                    }
                     if (!w.sc.settled(1f) || !w.yo.settled(0f) || !w.gl.settled(0f)) return false;
+                }
             return true;
+        }
+
+        /** Each letter of a long held syllable on its own: scale pop, tiny lift, fill sweep and a strong glow. */
+        private void drawLetters(Canvas cv, Block b, Word w, int cSung, int cUn) {
+            for (int i = 0; i < w.letters.length; i++) {
+                Letter L = w.letters[i];
+                int off = w.s + i;
+                if (b.text.charAt(off) == ' ') continue;
+                float x = padH + b.layout.getPrimaryHorizontal(off);
+                float base = padV + b.top + b.layout.getLineBaseline(b.layout.getLineForOffset(off));
+                cv.save();
+                cv.translate(x + L.width / 2f, base + L.yo.x * 2f * b.fontPx);
+                cv.scale(L.sc.x, L.sc.x, 0f, -b.fontPx * 0.3f);
+                cv.translate(-L.width / 2f, 0f);
+                if (L.prog <= 0f) { wp.setShader(null); wp.setColor(cUn); }
+                else if (L.prog >= 1f) { wp.setShader(null); wp.setColor(cSung); }
+                else {
+                    wp.setColor(WHITE);
+                    wp.setShader(new LinearGradient(0, 0, Math.max(1f, L.width), 0, new int[]{cSung, cSung, cUn, cUn},
+                            new float[]{0f, L.prog, Math.min(1f, L.prog + 0.2f), 1f}, Shader.TileMode.CLAMP));
+                }
+                float g = Math.max(0f, Math.min(1f, L.gl.x));
+                // Spicy: text-shadow 4 + 12g px at up to 185% opacity (we keep it a little softer)
+                if (g > 0.03f) wp.setShadowLayer(dp(4) + dp(12) * g, 0f, 0f,
+                        ((int) (Math.min(1f, g * 1.85f) * 0.75f * 255f) << 24) | 0xFFFFFF);
+                else wp.clearShadowLayer();
+                cv.drawText(b.text, off, off + 1, 0f, 0f, wp);
+                cv.restore();
+            }
+            wp.clearShadowLayer();
         }
 
         private int alpha(int argb, float f) {
@@ -742,6 +871,7 @@ public final class LyricsView extends ScrollView {
                 wp.setTextSize(b.fontPx);
                 wp.setTypeface(b.tp.getTypeface());
                 for (Word w : b.words) {
+                    if (w.letters != null) { drawLetters(cv, b, w, cSung, cUn); continue; }
                     int ln = b.layout.getLineForOffset(w.s);
                     float x = padH + b.layout.getPrimaryHorizontal(w.s);
                     float base = padV + b.top + b.layout.getLineBaseline(ln);
@@ -877,8 +1007,9 @@ public final class LyricsView extends ScrollView {
                     p.setMaskFilter(null);
                 }
                 // blurred like the lyrics around it: dots that are not sung yet are the softest
-                float pi = Math.max(0f, Math.min(1f, (s - DOT_SC_V[0]) / (DOT_SC_V[1] - DOT_SC_V[0])));
-                p.setMaskFilter(softness(1.4f + 2.6f * (1f - pi)));
+                float po = Math.max(0f, Math.min(1f, (op[i].x - DOT_OP_V[0]) / (1f - DOT_OP_V[0])));
+                float soft = 3.6f * (1f - po);                     // a dot that has been filled in is sharp
+                p.setMaskFilter(soft > 0.25f ? softness(soft) : null);
                 p.setColor(((int) (o * 255f) << 24) | 0xFFFFFF);
                 cv.drawCircle(cx, y, r * s, p);
                 p.setMaskFilter(null);

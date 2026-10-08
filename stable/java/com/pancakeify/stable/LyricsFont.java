@@ -12,20 +12,38 @@ import android.util.Log;
 final class LyricsFont {
     private LyricsFont() {}
 
-    private static final Typeface[] cache = new Typeface[2];
+    private static final Typeface[] cache = new Typeface[8];
 
-    /** {@code semibold}: weight 600 (background vocals), otherwise 700 like Spicy's lead lines. */
+    /** Forget cached faces (after the font option changed). */
+    static synchronized void reset() { java.util.Arrays.fill(cache, null); }
+
+    /** The face for the chosen font option. {@code semibold}: weight 600 (background vocals), else 700. */
     static synchronized Typeface get(Context c, boolean semibold) {
-        int i = semibold ? 1 : 0;
+        int font = LyricsSettings.font;
+        int i = font * 2 + (semibold ? 1 : 0);
         if (cache[i] != null) return cache[i];
+        int wght = semibold ? 600 : 700;
+        Typeface t = null;
         try {
-            cache[i] = new Typeface.Builder(c.getAssets(), "pancake/Inter.ttf")
-                    .setFontVariationSettings("'wght' " + (semibold ? 600 : 700) + ", 'opsz' 28")
-                    .build();
-        } catch (Throwable t) {
-            Log.w(PancakeBootstrap.TAG, "Inter font unavailable: " + t);
+            switch (font) {
+                case LyricsSettings.FONT_INTER:
+                    t = new Typeface.Builder(c.getAssets(), "pancake/Inter.ttf")
+                            .setFontVariationSettings("'wght' " + wght + ", 'opsz' 28").build();
+                    break;
+                case LyricsSettings.FONT_SYSTEM:
+                    t = Typeface.create(Typeface.DEFAULT, wght, false);
+                    break;
+                case LyricsSettings.FONT_SERIF:
+                    t = Typeface.create(Typeface.SERIF, wght, false);
+                    break;
+                default:
+                    break;
+            }
+        } catch (Throwable e) {
+            Log.w(PancakeBootstrap.TAG, "font " + font + " unavailable: " + e);
         }
-        if (cache[i] == null) cache[i] = PancakePrefsScreen.face(c, true);
-        return cache[i];
+        if (t == null) t = PancakePrefsScreen.face(c, true);      // Spotify Mix (also the fallback)
+        cache[i] = t;
+        return t;
     }
 }

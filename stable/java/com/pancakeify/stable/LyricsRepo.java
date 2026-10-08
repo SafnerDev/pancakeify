@@ -79,6 +79,7 @@ public final class LyricsRepo {
         public String source = "lrclib";     // "lrclib", or the Spicy API's own source id
         public boolean wordSynced;           // true when lines carry syllable timings
         public boolean fromSpicy;            // lyrics came from the Spicy Lyrics API (credits are shown)
+        long expiresAt = Long.MAX_VALUE;     // memory-cache expiry (set when read from / written to disk)
         public List<String> writers;         // songwriters, may be null
         public Person maker, uploader;       // community credits, may be null
         Result(List<Line> lines, String plain, boolean instrumental, boolean notFound) {
@@ -92,19 +93,36 @@ public final class LyricsRepo {
     private static final ExecutorService pool = Executors.newSingleThreadExecutor();
     private static final Handler main = new Handler(Looper.getMainLooper());
     private static final Pattern TS = Pattern.compile("\\[(\\d{1,3}):(\\d{1,2})(?:[.:](\\d{1,3}))?\\]");
-    private static final long NEG_CACHE_MS = 24L * 3600 * 1000;
+    // Cache model after Spicy Lyrics' own (LyricsStore: ExpireStore, CacheVersion 6, 3 days, "NO_LYRICS" entries):
+    // one file per track holding {v, exp, spicy | lrc | none}; plus a small in-memory LRU of parsed results so
+    // reopening a track (or skipping back) is instant and needs neither disk nor network.
+    private static final int CACHE_VERSION = 6;
+    private static final long TTL_SPICY_MS = 3L * 24 * 3600 * 1000;      // Spicy data: 3 days, like the original
+    private static final long TTL_FALLBACK_MS = 24L * 3600 * 1000;       // LRCLIB / "no lyrics": retry daily
+    private static final int MEM_ENTRIES = 24;
+    private static final java.util.LinkedHashMap<String, Result> mem =
+            new java.util.LinkedHashMap<String, Result>(32, 0.75f, true) {
+                @Override protected boolean removeEldestEntry(Entry<String, Result> e) { return size() > MEM_ENTRIES; }
+            };
+    private static boolean cleaned;
 
     public static void fetch(final Context ctx, final String key, final String title, final String artist,
                              final String album, final long durationMs, final Callback cb) {
         fetch(ctx, key, title, artist, album, durationMs, false, cb);
     }
 
-    /** {@code force} skips the disk cache (the "re-sync" button). */
+    /** {@code force} drops this track from every cache first (the "reload lyrics" action). */
     public static void fetch(final Context ctx, final String key, final String title, final String artist,
                              final String album, final long durationMs, final boolean force, final Callback cb) {
+        if (force) clearOne(ctx, key);
+        else {
+            final Result hit = memGet(key);
+            if (hit != null) { main.post(() -> cb.onResult(key, hit)); return; }
+        }
         pool.execute(() -> {
             Result r = null;
             try {
+                cleanupOnce(ctx);
                 r = force ? null : readCache(ctx, key);
                 if (r == null) {
                     String id = trackId(key);
@@ -131,6 +149,7 @@ public final class LyricsRepo {
                         if (!spicyDown) writeCache(ctx, key, r);
                     }
                 }
+                memPut(key, r);
             } catch (Throwable t) {
                 Log.w(PancakeBootstrap.TAG, "lyrics fetch failed: " + t);
                 // network trouble: not cached, so it is retried next time
@@ -139,6 +158,52 @@ public final class LyricsRepo {
             final Result out = r;
             main.post(() -> cb.onResult(key, out));
         });
+    }
+
+    private static synchronized Result memGet(String key) {
+        Result r = mem.get(key);
+        if (r != null && r.expiresAt < System.currentTimeMillis()) { mem.remove(key); return null; }
+        return r;
+    }
+
+    private static synchronized void memPut(String key, Result r) {
+        if (r != null) mem.put(key, r);
+    }
+
+    /** Drops one track from the memory and disk caches. */
+    public static void clearOne(Context ctx, String key) {
+        synchronized (LyricsRepo.class) { mem.remove(key); }
+        try { cacheFile(ctx, key).delete(); } catch (Throwable ignored) {}
+    }
+
+    /** Destroys the whole lyrics cache (settings -> "Clear lyrics cache"). */
+    public static void clearAll(Context ctx) {
+        synchronized (LyricsRepo.class) { mem.clear(); }
+        File[] fs = cacheDir(ctx).listFiles();
+        if (fs != null) for (File f : fs) f.delete();
+    }
+
+    /** {entries, bytes} currently on disk. */
+    public static long[] stats(Context ctx) {
+        long n = 0, bytes = 0;
+        File[] fs = cacheDir(ctx).listFiles();
+        if (fs != null) for (File f : fs) { n++; bytes += f.length(); }
+        return new long[]{n, bytes};
+    }
+
+    /** Once per process: delete entries from older cache versions and expired ones. */
+    private static synchronized void cleanupOnce(Context ctx) {
+        if (cleaned) return;
+        cleaned = true;
+        File[] fs = cacheDir(ctx).listFiles();
+        if (fs == null) return;
+        long now = System.currentTimeMillis();
+        for (File f : fs) {
+            try {
+                JSONObject o = new JSONObject(new String(java.nio.file.Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8));
+                if (o.optInt("v", 0) != CACHE_VERSION || o.optLong("exp", 0) < now) f.delete();
+            } catch (Throwable t) { f.delete(); }
+        }
     }
 
     /** "spotify:track:XXXX" -> "XXXX", anything else -> null. */
@@ -393,13 +458,17 @@ public final class LyricsRepo {
 
     // ------------------------------------------------------------------------------ cache
 
-    private static File cacheFile(Context ctx, String key) throws Exception {
+    private static File cacheDir(Context ctx) {
         File dir = new File(ctx.getCacheDir(), "pancakeify_lyrics");
         if (!dir.exists()) dir.mkdirs();
-        byte[] h = MessageDigest.getInstance("SHA-1").digest(("v2|" + key).getBytes(StandardCharsets.UTF_8));
+        return dir;
+    }
+
+    private static File cacheFile(Context ctx, String key) throws Exception {
+        byte[] h = MessageDigest.getInstance("SHA-1").digest(("v" + CACHE_VERSION + "|" + key).getBytes(StandardCharsets.UTF_8));
         StringBuilder sb = new StringBuilder();
         for (byte b : h) sb.append(String.format("%02x", b));
-        return new File(dir, sb + ".json");
+        return new File(cacheDir(ctx), sb + ".json");
     }
 
     private static Result readCache(Context ctx, String key) {
@@ -407,44 +476,53 @@ public final class LyricsRepo {
             File f = cacheFile(ctx, key);
             if (!f.exists()) return null;
             JSONObject o = new JSONObject(new String(java.nio.file.Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8));
-            if (o.has("spicy")) return parseSpicy(new JSONObject(o.getString("spicy")).getJSONObject("Body"));
-            // LRCLIB / negative entries expire so a track Spicy adds later gets picked up
-            if (System.currentTimeMillis() - f.lastModified() > NEG_CACHE_MS) return null;
-            if (o.optBoolean("notFound", false)) return new Result(null, null, false, true);
-            return fromJson(o);
+            long exp = o.optLong("exp", 0);
+            if (o.optInt("v", 0) != CACHE_VERSION || exp < System.currentTimeMillis()) { f.delete(); return null; }
+            Result r;
+            if (o.has("spicy")) r = parseSpicy(new JSONObject(o.getString("spicy")).getJSONObject("Body"));
+            else if (o.optBoolean("none", false)) r = new Result(null, null, false, true);   // "NO_LYRICS"
+            else r = fromJson(o.getJSONObject("lrc"));
+            if (r != null) r.expiresAt = exp;
+            return r;
         } catch (Throwable t) { return null; }
     }
 
-    private static void writeSpicyCache(Context ctx, String key, String raw) {
+    private static void writeEntry(Context ctx, String key, JSONObject o, long ttl, Result r) {
         try {
-            JSONObject o = new JSONObject();
-            o.put("spicy", raw);
+            long exp = System.currentTimeMillis() + ttl;
+            o.put("v", CACHE_VERSION).put("exp", exp);
             try (FileOutputStream fo = new FileOutputStream(cacheFile(ctx, key))) {
                 fo.write(o.toString().getBytes(StandardCharsets.UTF_8));
             }
-        } catch (Throwable t) { Log.w(PancakeBootstrap.TAG, "spicy cache write failed: " + t); }
+            if (r != null) r.expiresAt = exp;
+        } catch (Throwable t) { Log.w(PancakeBootstrap.TAG, "lyrics cache write failed: " + t); }
+    }
+
+    private static void writeSpicyCache(Context ctx, String key, String raw) {
+        try { writeEntry(ctx, key, new JSONObject().put("spicy", raw), TTL_SPICY_MS, null); }
+        catch (Throwable t) { Log.w(PancakeBootstrap.TAG, "spicy cache write failed: " + t); }
     }
 
     private static void writeCache(Context ctx, String key, Result r) {
         try {
             JSONObject o = new JSONObject();
-            if (r.notFound) o.put("notFound", true);
+            if (r.notFound) o.put("none", true);
             else {
-                o.put("instrumental", r.instrumental);
-                if (r.plain != null) o.put("plainLyrics", r.plain);
+                JSONObject l = new JSONObject();
+                l.put("instrumental", r.instrumental);
+                if (r.plain != null) l.put("plainLyrics", r.plain);
                 if (r.lines != null) {
                     StringBuilder sb = new StringBuilder();
-                    for (Line l : r.lines) {
-                        long t = l.startMs;
+                    for (Line ln : r.lines) {
+                        long t = ln.startMs;
                         sb.append(String.format("[%02d:%02d.%03d]", t / 60000, (t / 1000) % 60, t % 1000))
-                          .append(l.text).append('\n');
+                          .append(ln.text).append('\n');
                     }
-                    o.put("syncedLyrics", sb.toString());
+                    l.put("syncedLyrics", sb.toString());
                 }
+                o.put("lrc", l);
             }
-            try (FileOutputStream fo = new FileOutputStream(cacheFile(ctx, key))) {
-                fo.write(o.toString().getBytes(StandardCharsets.UTF_8));
-            }
+            writeEntry(ctx, key, o, TTL_FALLBACK_MS, r);
         } catch (Throwable t) { Log.w(PancakeBootstrap.TAG, "lyrics cache write failed: " + t); }
     }
 }
